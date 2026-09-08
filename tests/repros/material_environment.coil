@@ -1,0 +1,107 @@
+(module atlas.repros.material-environment)
+(import "atlas.view" :as view)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+
+(cimport "rlgl.h" :flags ["-I/opt/homebrew/include"] :use [rlReadTexturePixels])
+
+;;; Render the production fragment shader on controlled surface orientations.
+;;; This isolates material lighting from geometry, shadows, and post processing.
+(defn sample [(shader r/Shader)
+              (target r/RenderTexture)
+              (direction r/Vector3)
+              (color r/Color)] (-> r/Vector3)
+  (let [(mut n) (load direction)]
+    (view/float-uniform! shader
+                         (r/GetShaderLocation shader c"probeNormal")
+                         (field n x)
+                         2))
+  (r/BeginTextureMode target)
+  (r/ClearBackground (r/rgba 0 0 0 255))
+  (r/BeginShaderMode shader)
+  (r/DrawRectangle 0 0 32 32 color)
+  (r/EndShaderMode)
+  (r/EndTextureMode)
+  (let [pixels
+          (cast (ptr f32)
+                (rlReadTexturePixels (load (field (field target texture) id))
+                                     32
+                                     32
+                                     10))]
+    (if (= (cast i64 pixels) 0) (do (alloc/abort) 0) 0)
+    (let [result
+            (r/v3 (cast f64 (load (index pixels 0)))
+                  (cast f64 (load (index pixels 1)))
+                  (cast f64 (load (index pixels 2))))]
+      (r/MemFree (cast (ptr u8) pixels))
+      result)))
+
+(defn luminance [(rgb r/Vector3)] (-> f64)
+  (+ (* 0.2126 (cast f64 (load (field rgb x))))
+     (+ (* 0.7152 (cast f64 (load (field rgb y))))
+        (* 0.0722 (cast f64 (load (field rgb z)))))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (r/SetConfigFlags (cast u32 128))
+  (r/InitWindow 160 120 c"Atlas material environment regression")
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+    (let [shader
+            (r/LoadShaderFromMemory c"#version 330\nin vec3 vertexPosition;\nin vec4 vertexColor;\nuniform mat4 mvp;\nuniform vec3 probeNormal;\nout vec3 worldPosition;\nout vec3 normal;\nout vec4 color;\nout vec4 lightPosition;\nvoid main(){worldPosition=vec3(0,3,0);normal=probeNormal;color=vertexColor;lightPosition=vec4(3,3,3,1);gl_Position=mvp*vec4(vertexPosition,1);}\n"
+                                    (str/str->cstr (scratch/scratch-allocator (mut arena))
+                                                   (include-str "../../assets/shaders/world.fs")))
+          target (view/scene-target 32 32)
+          (mut eye)
+            (r/v3 (* (r/cos 0.72) (r/sin 0.65))
+                  (r/sin 0.72)
+                  (* (r/cos 0.72) (r/cos 0.65)))
+          (mut clip) (cast f32 10000.0)
+          (mut failures) 0
+          (mut state) 0]
+      (view/float-uniform! shader
+                           (r/GetShaderLocation shader c"viewDirection")
+                           (field eye x)
+                           2)
+      (view/float-uniform! shader
+                           (r/GetShaderLocation shader c"clipHeight")
+                           (mut clip)
+                           0)
+      (loop (if (> (load state) 3) (break 0) 0)
+        (let [color (glyph/glyph-color (load state) false)
+              front (sample shader target (r/v3 0.0 0.0 1.0) color)
+              side (sample shader target (r/v3 1.0 0.0 0.0) color)
+              roof (sample shader target (r/v3 0.0 1.0 0.0) color)]
+          (println "Material {}: front RGB=({}, {}, {}), front/side/roof luminance=({}, {}, {})"
+                   (load state)
+                   (load (field front x))
+                   (load (field front y))
+                   (load (field front z))
+                   (luminance front)
+                   (luminance side)
+                   (luminance roof))
+          ;; Broad fill makes vertical metal legible but does not erase the key light.
+          (if (and (> (luminance front) 0.12)
+                   (> (luminance side) 0.07)
+                   (< (luminance front) (luminance roof))
+                   (< (luminance roof) 2.0))
+              0
+              (store! failures (+ (load failures) 1)))
+          (if (cond (= (load state) 0)
+                      (< (load (field front x)) (load (field front z)))
+                    (= (load state) 1)
+                      (and (> (load (field front x)) (load (field front y)))
+                           (> (load (field front y)) (load (field front z))))
+                    (= (load state) 2)
+                      (> (load (field front y)) (load (field front x)))
+                    :else (> (load (field front x)) (load (field front y))))
+              0
+              (store! failures (+ (load failures) 1))))
+        (store! state (+ (load state) 1)))
+      (r/UnloadRenderTexture target)
+      (r/UnloadShader shader)
+      (r/CloseWindow)
+      (scratch/scratch-close! (mut arena))
+      (load failures))))

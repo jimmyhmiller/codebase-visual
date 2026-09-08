@@ -1,0 +1,118 @@
+(module atlas.geography)
+(import "atlas.ray" :as r)
+(import "atlas.landform" :as land)
+(import "atlas.model" :as m)
+(import "coil.slice" :use [slice-len slice-get subslice])
+
+;;; Atlas's constrained regional heightfield. See CREDITS.md for the terrain
+;;; shaping and archipelago references. This is an original implementation,
+;;; not an erosion simulation or a port of the referenced generators.
+;;; All noise is evaluated in world coordinates: adjacent coastlines and
+;;; submerged shelves belong to the same landscape, not independent stamps.
+(defn smooth [(a f64) (b f64) (x f64)] (-> f64)
+  (let [t (r/clamp (/ (- x a) (- b a)) 0.0 1.0)]
+    (* t (* t (- 3.0 (* 2.0 t))))))
+
+(defn regional [(x f64) (z f64)] (-> f64)
+  (let [wx (+ x (* 18.0 (- (land/noise2 13.0 (* x 0.013) (* z 0.013)) 0.5)))
+        wz (+ z (* 18.0 (- (land/noise2 71.0 (* x 0.013) (* z 0.013)) 0.5)))]
+    (+ (* 0.60 (land/noise2 31.0 (* wx 0.035) (* wz 0.022)))
+       (+ (* 0.28 (land/noise2 83.0 (* wx 0.085) (* wz 0.065)))
+          (* 0.12 (land/noise2 107.0 (* wx 0.23) (* wz 0.17)))))))
+
+;;; Spatially correlated ridges influence placement at folder scale. Compactness
+;;; is a soft cost, not an expanding ring that every candidate must fill.
+(defn placement-score [(seed i64) (p r/Vector3) (scale f64)] (-> f64)
+  (let [x (/ (cast f64 (load (field p x))) scale)
+        z (/ (cast f64 (load (field p z))) scale)
+        s (* 0.019 (cast f64 (% seed 997)))
+        ridge (land/noise2 s (+ 9.2 (* x 0.55)) (+ 3.7 (* z 0.55)))
+        broad (+ (* x x) (* 1.3 (* z z)))]
+    (+ (* 0.14 broad) (* 5.5 (* (- 1.0 ridge) (- 1.0 ridge))))))
+
+(defn gap [(seed i64) (p r/Vector3) (radius f64)] (-> f64)
+  (let [s (* 0.031 (cast f64 (% seed 997)))
+        n
+          (land/noise2 s
+                       (* 0.025 (cast f64 (load (field p x))))
+                       (* 0.025 (cast f64 (load (field p z)))))]
+    (+ 4.0 (* (* 0.65 radius) (* n n)))))
+
+(defn heading [(seed i64)] (-> f64)
+  (* 0.017 (cast f64 (% seed 367))))
+
+;;; Files on the same regional ridge share a prevailing direction, with small
+;;; local deviations. This avoids a random rotation for every neighboring isle.
+(defn ridge-seed [(path (slice u8))] (-> i64)
+  (let [(mut last) 0
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len path)) (break 0) 0)
+      (if (= (slice-get path (load i)) (cast u8 47)) (store! last (load i)) 0)
+      (store! i (+ (load i) 1)))
+    (+ (% (m/stable-hash (subslice path 0 (load last))) 347)
+       (% (m/stable-hash path) 20))))
+
+;;; Settlement sites follow a broad, gently curved ridge instead of filling a
+;;; disk. This nonnegative cost participates in the existing clearance search;
+;;; it never moves a reserved building or weakens its separation constraints.
+(defn site-cost [(seed i64) (x f64) (z f64)] (-> f64)
+  (let [angle (heading seed)
+        u (+ (* x (r/cos angle)) (* z (r/sin angle)))
+        v (- (* z (r/cos angle)) (* x (r/sin angle)))
+        curve
+          (* 0.22
+             (* u (r/sin (+ (/ u 35.0) (* 0.011 (cast f64 (% seed 173)))))))
+        cross (- v curve)]
+    (* 12.0 (* cross cross))))
+
+;;; Coarse coast/ridge constraints establish composition; multiscale detail
+;;; does not suppress the large features. A conservative radial reservation is
+;;; ONLY a collision bound. The sea-level contour may have bays, peninsulas,
+;;; disconnected skerries and multiple crossings of a ray from the town hall.
+(defn bed [(island m/Island) (x f64) (z f64)] (-> f64)
+  (let [p (load (field island position))
+        radius (load (field island radius))
+        dx (- x (cast f64 (load (field p x))))
+        dz (- z (cast f64 (load (field p z))))
+        angle (heading (ridge-seed (load (field island name))))
+        u (+ (* dx (r/cos angle)) (* dz (r/sin angle)))
+        v (- (* dz (r/cos angle)) (* dx (r/sin angle)))
+        distance (/ (r/sqrt (+ (* u u) (* 3.5 (* v v)))) radius)
+        noise (regional x z)
+        coast (+ (* 7.5 (- 0.68 distance)) (* 10.0 (- noise 0.48)))
+        limit (* radius (land/main-coast-bound))
+        edge (- limit (r/sqrt (+ (* dx dx) (* dz dz))))]
+    (if (< edge 0.0)
+        -4.0
+        (r/mix -4.0 coast (smooth 0.0 2.0 edge)))))
+
+;;; A two-unit maximum grid spacing makes a three-unit flattening margin
+;;; sufficient for every triangle touching a 1.05-unit building foundation.
+;;; The civic reservation follows the largest historical town-hall footprint.
+;;; These constraints preserve all historical sites, including removed ones.
+(defn elevation [(island m/Island) (x f64) (z f64) (clearance f64)] (-> f64)
+  (let [p (load (field island position))
+        dx (- x (cast f64 (load (field p x))))
+        dz (- z (cast f64 (load (field p z))))
+        town-distance (r/sqrt (+ (* dx dx) (* dz dz)))
+        town-scale
+          (r/clamp (+ 0.7
+                      (* 0.10 (r/sqrt (cast f64 (load (field island count))))))
+                   0.8
+                   2.4)
+        town-pad (+ (* 2.405 town-scale) 2.83)
+        mask
+          (* (smooth 3.9 6.5 clearance)
+             (smooth town-pad (+ town-pad 2.1) town-distance))
+        h (bed island x z)
+        high (+ 2.0 (* 2.0 (smooth 0.48 0.75 (regional x z))))
+        natural (r/clamp h -4.0 high)]
+    (r/mix 1.94 natural mask)))
+
+(defn color [(x f64) (z f64) (height f64) (slope f64)] (-> r/Color)
+  (let [n (regional x z)
+        grass (r/rgba 76 94 64 255)
+        rock (r/rgba 104 108 93 255)
+        sand (r/rgba 156 151 113 255)
+        base (if (< height 0.15) sand (if (> slope 0.75) rock grass))]
+    (r/shade base (+ 0.82 (* 0.30 n)))))

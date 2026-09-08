@@ -1,0 +1,14 @@
+(module atlas.tests.history-limit)
+(import "atlas.repository" :as git)
+
+(deftest history-limit-rejects-invalid-and-overflow
+         (assert-eq (git/parse-history-limit "1") 1)
+         (assert-eq (git/parse-history-limit "128") 128)
+         (assert-eq (git/parse-history-limit "9223372036854775807")
+                    9223372036854775807)
+         (assert-eq (git/parse-history-limit "9223372036854775808") -1)
+         (assert-eq (git/parse-history-limit "99999999999999999999999") -1)
+         (assert-eq (git/parse-history-limit "0") -1)
+         (assert-eq (git/parse-history-limit "-4") -1)
+         (assert-eq (git/parse-history-limit "12x") -1)
+         (assert-eq (git/parse-history-limit "") -1))

@@ -1,0 +1,16 @@
+# Atlas event 1000 carries a Unicode codepoint; other events are raylib events.
+# Query Order, test that timeline and camera shortcuts are consumed, leave open.
+c 13
+e 10 2 47 0 0 0
+e 11 1 47 0 0 0
+e 20 1000 79 0 0 0
+e 21 1000 114 0 0 0
+e 22 1000 100 0 0 0
+e 23 1000 101 0 0 0
+e 24 1000 114 0 0 0
+e 30 2 262 0 0 0
+e 31 1 262 0 0 0
+e 40 2 87 0 0 0
+e 60 1 87 0 0 0
+e 70 2 32 0 0 0
+e 71 1 32 0 0 0

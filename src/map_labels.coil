@@ -1,0 +1,230 @@
+(module atlas.map-labels)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+;;; An orthographic upright cylinder projects to an ellipse swept vertically.
+;;; Cover it by horizontal bands, each as wide as the widest cross-section in
+;;; that band. This is conservative over the entire continuous silhouette,
+;;; unlike point sampling, but frees the empty corners of its bounding box.
+(defn reserve-island! [(obstacles (ptr (al/ArrayList r/Rectangle)))
+                       (bounds r/Rectangle)
+                       (ellipse-y f64)] (-> i64)
+  (let [x (cast f64 (load (field bounds x)))
+        y (cast f64 (load (field bounds y)))
+        width (cast f64 (load (field bounds width)))
+        height (cast f64 (load (field bounds height)))
+        ry (r/clamp ellipse-y 0.0 (* height 0.5))]
+    (if (<= ry 0.00001)
+        (do (al/al-push! (mut obstacles) bounds) 0)
+        (let [center-x (+ x (* width 0.5))
+              core-top (+ y ry)
+              core-bottom (- (+ y height) ry)
+              step (/ height 16.0)
+              (mut i) 0]
+          (loop (if (>= (load i) 16) (break 0) 0)
+            (let [top (+ y (* (cast f64 (load i)) step))
+                  bottom (+ top step)
+                  distance
+                    (cond (< bottom core-top) (- core-top bottom)
+                          (> top core-bottom) (- top core-bottom)
+                          :else 0.0)
+                  ratio (/ distance ry)
+                  half
+                    (* (* width 0.5)
+                       (r/sqrt (r/clamp (- 1.0 (* ratio ratio)) 0.0 1.0)))]
+              ;; Small outward padding absorbs float32 rectangle conversion.
+              (al/al-push! (mut obstacles)
+                           (r/rect (- (- center-x half) 0.01)
+                                   (- top 0.01)
+                                   (+ (* half 2.0) 0.02)
+                                   (+ step 0.02))))
+            (store! i (+ (load i) 1)))
+          0))))
+
+(defn overlaps? [(a r/Rectangle) (b r/Rectangle)] (-> bool)
+  (and (< (load (field a x)) (+ (load (field b x)) (load (field b width))))
+       (> (+ (load (field a x)) (load (field a width))) (load (field b x)))
+       (< (load (field a y)) (+ (load (field b y)) (load (field b height))))
+       (> (+ (load (field a y)) (load (field a height))) (load (field b y)))))
+
+(defn contains? [(outer r/Rectangle) (inner r/Rectangle)] (-> bool)
+  (and (>= (load (field inner x)) (load (field outer x)))
+       (>= (load (field inner y)) (load (field outer y)))
+       (<= (+ (load (field inner x)) (load (field inner width)))
+           (+ (load (field outer x)) (load (field outer width))))
+       (<= (+ (load (field inner y)) (load (field inner height)))
+           (+ (load (field outer y)) (load (field outer height))))))
+
+;;; Twenty stable candidates around the projected envelope. The final four
+;;; straddle its corners, and are accepted only if the curved reservation clears.
+;;; No clamping onto geometry: an unavailable label is omitted, not misplaced.
+(defn candidate [(island r/Rectangle) (width f64) (height f64) (index i64)] (-> r/Rectangle)
+  (let [x (cast f64 (load (field island x)))
+        y (cast f64 (load (field island y)))
+        w (cast f64 (load (field island width)))
+        h (cast f64 (load (field island height)))
+        side (% index 4)
+        align (/ index 4)
+        along-x
+          (cond (= align 0) (+ x (* 0.5 (- w width)))
+                (= align 1) x
+                :else (- (+ x w) width))
+        along-y
+          (cond (= align 0) (+ y (* 0.5 (- h height)))
+                (= align 1) y
+                :else (- (+ y h) height))]
+    (cond (>= index 16)
+            (r/rect (- (if (= (% index 2) 0) x (+ x w)) (* width 0.5))
+                    (- (if (< index 18) y (+ y h)) (* height 0.5))
+                    width
+                    height)
+          (>= index 12)
+            (r/rect (if (= (% index 2) 0) (- x (+ width 6.0)) (+ (+ x w) 6.0))
+                    (if (< index 14) (- y (+ height 6.0)) (+ (+ y h) 6.0))
+                    width
+                    height)
+          (= side 0) (r/rect along-x (+ (+ y h) 6.0) width height)
+          (= side 1) (r/rect along-x (- y (+ height 6.0)) width height)
+          (= side 2) (r/rect (+ (+ x w) 6.0) along-y width height)
+          :else (r/rect (- x (+ width 6.0)) along-y width height))))
+
+(defn place [(island r/Rectangle)
+             (width f64)
+             (height f64)
+             (viewport r/Rectangle)
+             (obstacles (al/ArrayList r/Rectangle))] (-> (Option r/Rectangle))
+  (block :search
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 20) (break 0) 0)
+             (let [box (candidate island width height (load i))
+                   (mut available) (contains? viewport box)
+                   (mut j) 0]
+               (loop (if (or (not (load available))
+                             (>= (load j) (al/al-len obstacles)))
+                         (break 0)
+                         0)
+                 (if (overlaps? box (al/al-get obstacles (load j)))
+                     (store! available false)
+                     0)
+                 (store! j (+ (load j) 1)))
+               (if (load available) (break :search (Some box)) 0))
+             (store! i (+ (load i) 1))))
+         (nearest-space island width height viewport obstacles)))
+
+;;; Bounded screen-space fallback after the cheap anchor candidates fail.
+;;; Search an 8-pixel lattice and choose the clear position nearest the island
+;;; center. This can recover gaps that do not align with a cardinal/corner anchor.
+;;; The caller includes this island's reservation in obstacles, too.
+(defn nearest-space [(island r/Rectangle)
+                     (width f64)
+                     (height f64)
+                     (viewport r/Rectangle)
+                     (obstacles (al/ArrayList r/Rectangle))] (-> (Option r/Rectangle))
+  (let [left (cast f64 (load (field viewport x)))
+        top (cast f64 (load (field viewport y)))
+        right (+ left (cast f64 (load (field viewport width))))
+        bottom (+ top (cast f64 (load (field viewport height))))
+        cx
+          (+ (cast f64 (load (field island x)))
+             (* 0.5 (cast f64 (load (field island width)))))
+        cy
+          (+ (cast f64 (load (field island y)))
+             (* 0.5 (cast f64 (load (field island height)))))
+        (mut result) (None [r/Rectangle])
+        (mut best) 1.0e30
+        columns (cast i64 (r/floor (/ (- (- right left) width) 8.0)))
+        rows (cast i64 (r/floor (/ (- (- bottom top) height) 8.0)))
+        stride (+ columns 2)
+        (mut grid) (al/al-new [i64] (alloc/malloc-allocator))
+        (mut i) 0
+        (mut row) 0]
+    ;; Minkowski-expand each obstacle by the label dimensions. Its blocked
+    ;; lattice origins form an integer rectangle. Four difference-array updates
+    ;; per obstacle plus one prefix scan give exact occupancy in O(N + pixels),
+    ;; instead of testing every candidate against every obstacle.
+    (if (and (>= columns 0) (>= rows 0))
+        (do
+          (loop (if (>= (load i) (* stride (+ rows 2))) (break 0) 0)
+            (al/al-push! (mut grid) 0)
+            (store! i (+ (load i) 1)))
+          (store! i 0)
+          (loop (if (>= (load i) (al/al-len obstacles)) (break 0) 0)
+            (let [o (al/al-get obstacles (load i))
+                  ox (cast f64 (load (field o x)))
+                  oy (cast f64 (load (field o y)))
+                  x0
+                    (cast i64
+                          (r/clamp (+ (r/floor (/ (- (- ox width) left) 8.0))
+                                      1.0)
+                                   0.0
+                                   (cast f64 (+ columns 1))))
+                  y0
+                    (cast i64
+                          (r/clamp (+ (r/floor (/ (- (- oy height) top) 8.0))
+                                      1.0)
+                                   0.0
+                                   (cast f64 (+ rows 1))))
+                  x1
+                    (cast i64
+                          (r/clamp (r/ceil (/ (- (+ ox
+                                                    (cast f64
+                                                          (load (field o width))))
+                                                 left)
+                                              8.0))
+                                   0.0
+                                   (cast f64 (+ columns 1))))
+                  y1
+                    (cast i64
+                          (r/clamp (r/ceil (/ (- (+ oy
+                                                    (cast f64
+                                                          (load (field o height))))
+                                                 top)
+                                              8.0))
+                                   0.0
+                                   (cast f64 (+ rows 1))))]
+              (if (and (< x0 x1) (< y0 y1))
+                  (do
+                    (bump! (mut grid) (+ (* y0 stride) x0) 1)
+                    (bump! (mut grid) (+ (* y0 stride) x1) -1)
+                    (bump! (mut grid) (+ (* y1 stride) x0) -1)
+                    (bump! (mut grid) (+ (* y1 stride) x1) 1))
+                  0))
+            (store! i (+ (load i) 1)))
+          (loop (if (> (load row) rows) (break 0) 0)
+            (let [(mut column) 0
+                  (mut running) 0
+                  y (+ top (* (cast f64 (load row)) 8.0))]
+              (loop (if (> (load column) columns) (break 0) 0)
+                (let [index (+ (* (load row) stride) (load column))
+                      x (+ left (* (cast f64 (load column)) 8.0))]
+                  (store! running
+                          (+ (load running) (al/al-get (load grid) index)))
+                  (let [count
+                          (+ (load running)
+                             (if (> (load row) 0)
+                                 (al/al-get (load grid) (- index stride))
+                                 0))]
+                    (store! (al/al-elem [i64] (mut grid) index) count)
+                    (if (= count 0)
+                        (let [box (r/rect x y width height)
+                              dx (- (+ x (* width 0.5)) cx)
+                              dy (- (+ y (* height 0.5)) cy)
+                              score (+ (* dx dx) (* dy dy))]
+                          (if (< score (load best))
+                              (do
+                                (store! best score)
+                                (store! result (Some box)))
+                              0))
+                        0)))
+                (store! column (+ (load column) 1))))
+            (store! row (+ (load row) 1)))
+          0)
+        0)
+    (al/al-free! (mut grid))
+    (load result)))
+
+(defn bump! [(grid (ptr (al/ArrayList i64))) (index i64) (delta i64)] (-> i64)
+  (store! (al/al-elem [i64] (mut grid) index)
+          (+ (al/al-get (load grid) index) delta))
+  0)

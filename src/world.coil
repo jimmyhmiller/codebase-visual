@@ -1,0 +1,1211 @@
+(module atlas.world)
+(import "atlas.model" :as m)
+(import "atlas.folders" :as folders)
+(import "atlas.organic" :as organic)
+(import "atlas.contours" :as contours)
+(import "atlas.ray" :as r)
+(import "atlas.timeline" :as timeline)
+(import "atlas.landform" :as land)
+(import "atlas.geography" :as geography)
+(import "atlas.spatial" :as spatial)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.hashmap" :as hm)
+(import "coil.primitive" :as primitive)
+(import "atlas.impact" :as impact)
+(import "coil.slice" :use [slice-len slice-get subslice])
+
+(defstruct World
+  [(islands (al/ArrayList m/Island))
+   (registry (al/ArrayList m/Entity))
+   (folders folders/Tree)])
+
+(defn new-world [(a (dyn alloc/Allocator))] (-> World)
+  (World
+    :islands (al/al-new [m/Island] a)
+    :registry (al/al-new [m/Entity] a)
+    :folders (folders/new-tree a)))
+
+;;; Rendering updates only Island.changed while an analysis worker is active.
+;;; Copy the immutable layout fields individually, never that mutable counter.
+(defn copy-island [(island (ptr m/Island)) (a (dyn alloc/Allocator))] (-> m/Island)
+  (m/Island
+    :name (m/copy-text a (load (field island name)))
+    :seed (load (field island seed))
+    :position (load (field island position))
+    :radius (load (field island radius))
+    :count (load (field island count))
+    :changed 0))
+
+(defn copy-layout [(source (ptr World)) (a (dyn alloc/Allocator))] (-> World)
+  (let [(mut result) (new-world a)
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field source islands))))
+              (break 0)
+              0)
+      (al/al-push! (mut (field result islands))
+                   (copy-island (al/al-elem [m/Island]
+                                            (field source islands)
+                                            (load i))
+                                a))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field source registry))))
+              (break 0)
+              0)
+      (al/al-push! (mut (field result registry))
+                   (m/copy-entity a
+                                  (al/al-get (load (field source registry))
+                                             (load i))))
+      (store! i (+ (load i) 1)))
+    (store! (field result folders) (folders/copy-tree (field source folders) a))
+    (load result)))
+
+;;; Commit a staged append-only layout into long-lived storage after joining
+;;; its worker. No renderer pointers survive into the reusable worker arena.
+(defn adopt-layout! [(target (ptr World)) (source (ptr World))] (-> i64)
+  (folders/copy-borders! (field target folders) (field source folders))
+  (let [a (load (field (field target islands) alc))
+        (mut i) 0]
+    (loop (if (>= (load i)
+                  (al/al-len (load (field (field source folders) nodes))))
+              (break 0)
+              0)
+      (let [(mut node)
+              (al/al-get (load (field (field source folders) nodes)) (load i))]
+        (if (>= (load i)
+                (al/al-len (load (field (field target folders) nodes))))
+            (do
+              (store! (field node path)
+                      (m/copy-text a (load (field node path))))
+              (al/al-push! (field (field target folders) nodes) (load node))
+              (folders/index-node! (field target folders)
+                                   (load (field node path))
+                                   (load i)))
+            (let [out
+                    (al/al-elem [folders/Node]
+                                (field (field target folders) nodes)
+                                (load i))]
+              (store! (field out position) (load (field node position)))
+              (store! (field out radius) (load (field node radius)))
+              (store! (field out border-first) (load (field node border-first)))
+              (store! (field out border-count) (load (field node border-count)))
+              (store! (field out border-label) (load (field node border-label)))
+              (store! (field out island) (load (field node island)))
+              0)))
+      (let [out
+              (al/al-elem [folders/Node]
+                          (field (field target folders) nodes)
+                          (load i))
+            node
+              (al/al-get (load (field (field source folders) nodes)) (load i))]
+        (store! (field out first-child) (load (field node first-child)))
+        (store! (field out next-sibling) (load (field node next-sibling))))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field source islands))))
+              (break 0)
+              0)
+      (let [island (al/al-elem [m/Island] (field source islands) (load i))]
+        (if (>= (load i) (al/al-len (load (field target islands))))
+            (al/al-push! (mut (field target islands)) (copy-island island a))
+            (let [out (al/al-elem [m/Island] (field target islands) (load i))]
+              (store! (field out position) (load (field island position)))
+              (store! (field out radius) (load (field island radius)))
+              (store! (field out count) (load (field island count)))
+              0)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field source registry))))
+              (break 0)
+              0)
+      (let [entity (al/al-get (load (field source registry)) (load i))]
+        (if (>= (load i) (al/al-len (load (field target registry))))
+            (al/al-push! (mut (field target registry))
+                         (m/copy-entity (load (field (field target registry)
+                                                     alc))
+                                        entity))
+            (let [out (al/al-elem [m/Entity] (field target registry) (load i))]
+              (store! (field out position) (load (field entity position)))
+              0)))
+      (store! i (+ (load i) 1)))
+    0))
+
+;;; x/z are the map center; y is pixels per world unit. Shared by drawing and
+;;; hit testing so the tactical map stays accurate for arbitrarily sized worlds.
+(defn map-frame [(world (ptr World))] (-> r/Vector3)
+  (let [(mut minx) 0.0
+        (mut maxx) 0.0
+        (mut minz) 0.0
+        (mut maxz) 0.0
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field world islands))))
+              (break 0)
+              0)
+      (let [island (al/al-get (load (field world islands)) (load i))
+            p (load (field island position))
+            radius (* 1.35 (load (field island radius)))
+            x (cast f64 (load (field p x)))
+            z (cast f64 (load (field p z)))]
+        (store! minx (if (< (- x radius) (load minx)) (- x radius) (load minx)))
+        (store! maxx (if (> (+ x radius) (load maxx)) (+ x radius) (load maxx)))
+        (store! minz (if (< (- z radius) (load minz)) (- z radius) (load minz)))
+        (store! maxz (if (> (+ z radius) (load maxz)) (+ z radius) (load maxz))))
+      (store! i (+ (load i) 1)))
+    (let [xspan (+ 1.0 (- (load maxx) (load minx)))
+          zspan (+ 1.0 (- (load maxz) (load minz)))
+          sx (/ 150.0 xspan)
+          sz (/ 130.0 zspan)]
+      (r/v3 (* 0.5 (+ (load minx) (load maxx)))
+            (if (< sx sz) sx sz)
+            (* 0.5 (+ (load minz) (load maxz)))))))
+
+(defn find-island [(world (ptr World)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0
+        islands (load (field world islands))]
+    (loop (if (>= (load i) (al/al-len islands)) (break -1) 0)
+      (let [island (al/al-get islands (load i))]
+        (if (str/str-eq (load (field island name)) name) (break (load i)) 0))
+      (store! i (+ (load i) 1)))))
+
+(defn resolve-import [(world (ptr World)) (name (slice u8))] (-> i64)
+  (let [exact (find-island world name)]
+    (if (>= exact 0)
+        exact
+        (let [(mut i) 0
+              (mut start) 0]
+          (loop (if (>= (load i) (slice-len name)) (break 0) 0)
+            (let [c (cast i64 (slice-get name (load i)))]
+              (if (or (= c 46) (= c 47)) (store! start (+ (load i) 1)) 0))
+            (store! i (+ (load i) 1)))
+          (find-island world (subslice name (load start) (slice-len name)))))))
+
+(defn find-entity [(entities (al/ArrayList m/Entity)) (id i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len entities)) (break -1) 0)
+      (let [e (al/al-get entities (load i))]
+        (if (= (load (field e id)) id) (break (load i)) 0))
+      (store! i (+ (load i) 1)))))
+
+(defn find-declaration [(entities (al/ArrayList m/Entity)) (entity m/Entity)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len entities)) (break -1) 0)
+      (let [e (al/al-get entities (load i))]
+        (if (and (!= (load (field e state)) 3)
+                 (str/str-eq (load (field e name)) (load (field entity name)))
+                 (str/str-eq (load (field e path)) (load (field entity path))))
+            (break (load i))
+            0))
+      (store! i (+ (load i) 1)))))
+
+(defn rename-candidate [(old (al/ArrayList m/Entity))
+                        (next (al/ArrayList m/Entity))
+                        (entity m/Entity)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1
+        (mut count) 0
+        (mut new-count) 0]
+    (loop (if (>= (load i) (al/al-len old)) (break 0) 0)
+      (let [e (al/al-get old (load i))]
+        (if (and (!= (load (field e state)) 3)
+                 (= (load (field e shape)) (load (field entity shape)))
+                 (= (load (field e kind)) (load (field entity kind)))
+                 (< (find-declaration next e) 0))
+            (do (store! found (load i)) (store! count (+ (load count) 1)))
+            0))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len next)) (break 0) 0)
+      (let [e (al/al-get next (load i))]
+        (if (and (= (load (field e shape)) (load (field entity shape)))
+                 (= (load (field e kind)) (load (field entity kind)))
+                 (< (find-declaration old e) 0))
+            (store! new-count (+ (load new-count) 1))
+            0))
+      (store! i (+ (load i) 1)))
+    (if (and (= (load count) 1) (= (load new-count) 1)) (load found) -1)))
+
+;;; Only newly registered declarations are placed. Source-file peers provide
+;;; a weak neighborhood preference; already placed lexical references provide
+;;; a stronger one. No later analysis result moves an established building.
+(defn settlement-focus [(registry (al/ArrayList m/Entity))
+                        (references (al/ArrayList m/Reference))
+                        (entity m/Entity)
+                        (island i64)
+                        (center r/Vector3)] (-> r/Vector3)
+  (let [(mut file-x) 0.0
+        (mut file-z) 0.0
+        (mut file-count) 0.0
+        (mut ref-x) 0.0
+        (mut ref-z) 0.0
+        (mut ref-count) 0.0
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len registry)) (break 0) 0)
+      (let [peer (al/al-get registry (load i))
+            p (load (field peer position))]
+        (if (and (= (load (field peer island)) island)
+                 (str/str-eq (load (field peer path))
+                             (load (field entity path))))
+            (do
+              (store! file-x (+ (load file-x) (cast f64 (load (field p x)))))
+              (store! file-z (+ (load file-z) (cast f64 (load (field p z)))))
+              (store! file-count (+ (load file-count) 1.0)))
+            0))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len references)) (break 0) 0)
+      (let [ref (al/al-get references (load i))
+            outgoing (= (load (field ref source)) (load (field entity id)))
+            incoming
+              (and (str/str-eq (load (field ref target))
+                               (load (field entity name)))
+                   (str/str-eq (load (field ref module))
+                               (load (field entity module))))]
+        (if (or outgoing incoming)
+            (let [(mut j) 0]
+              (loop (if (>= (load j) (al/al-len registry)) (break 0) 0)
+                (let [peer (al/al-get registry (load j))]
+                  (if (and (= (load (field peer island)) island)
+                           (if outgoing
+                               (str/str-eq (load (field peer name))
+                                           (load (field ref target)))
+                               (= (load (field peer id))
+                                  (load (field ref source)))))
+                      (let [p (load (field peer position))]
+                        (store! ref-x
+                                (+ (load ref-x) (cast f64 (load (field p x)))))
+                        (store! ref-z
+                                (+ (load ref-z) (cast f64 (load (field p z)))))
+                        (store! ref-count (+ (load ref-count) 1.0))
+                        (break 0))
+                      0))
+                (store! j (+ (load j) 1))))
+            0))
+      (store! i (+ (load i) 1)))
+    (let [fw (if (> (load file-count) 0.0) 2.0 0.0)
+          rw (if (> (load ref-count) 0.0) 8.0 0.0)
+          divisor (+ 1.0 (+ fw rw))
+          fx (if (> fw 0.0) (/ (* fw (load file-x)) (load file-count)) 0.0)
+          fz (if (> fw 0.0) (/ (* fw (load file-z)) (load file-count)) 0.0)
+          rx (if (> rw 0.0) (/ (* rw (load ref-x)) (load ref-count)) 0.0)
+          rz (if (> rw 0.0) (/ (* rw (load ref-z)) (load ref-count)) 0.0)]
+      (r/v3 (/ (+ (cast f64 (load (field center x))) (+ fx rx)) divisor)
+            2.0
+            (/ (+ (cast f64 (load (field center z))) (+ fz rz)) divisor)))))
+
+(defn settlement-position [(world (ptr World))
+                           (snapshot (ptr m/Snapshot))
+                           (entity m/Entity)
+                           (island i64)] (-> r/Vector3)
+  (let [registry (load (field world registry))
+        module (al/al-get (load (field world islands)) island)
+        center (load (field module position))
+        focus
+          (settlement-focus registry
+                            (load (field snapshot references))
+                            entity
+                            island
+                            center)
+        (mut sites) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+        (mut other-files) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len registry)) (break 0) 0)
+      (let [peer (al/al-get registry (load i))]
+        (if (= (load (field peer island)) island)
+            (do
+              (al/al-push! (mut sites) (load (field peer position)))
+              (if (not (str/str-eq (load (field peer path))
+                                   (load (field entity path))))
+                  (al/al-push! (mut other-files) (load (field peer position)))
+                  0))
+            0))
+      (store! i (+ (load i) 1)))
+    (let [(mut indexed) (spatial/build (load sites) (alloc/malloc-allocator))
+          (mut districts)
+            (spatial/build (load other-files) (alloc/malloc-allocator))
+          phase
+            (* (cast f64 (& (load (field entity id)) 65535))
+               (/ 6.283185307179586 65536.0))
+          (mut attempt) 0
+          capacity (- (land/plateau-inradius (load (field module radius))) 1.05)
+          seed (* (cast f64 (% (load (field module seed)) 997)) 0.019)
+          ridge-seed (geography/ridge-seed (load (field module name)))
+          (mut best-score) 1.0e30
+          (mut result) (load focus)]
+      ;; Expanding deterministic search cannot become trapped in a full
+      ;; neighborhood. The spatial index checks actual occupied sites, including
+      ;; historical reservations, rather than assuming candidate separation.
+      ;; Penalize footprint growth so a reference near the coast does not
+      ;; unnecessarily stretch the island when a nearby interior site fits.
+      ;; Search ends when distance alone exceeds the best total score.
+      (loop (let [radius (* 0.55 (r/sqrt (cast f64 (load attempt))))
+                  angle
+                    (+ phase (* (cast f64 (load attempt)) 2.399963229728653))
+                  candidate
+                    (r/v3 (+ (cast f64 (load (field focus x)))
+                             (* radius (r/cos angle)))
+                          2.0
+                          (+ (cast f64 (load (field focus z)))
+                             (* radius (r/sin angle))))
+                  lower-bound
+                    (+ (* radius radius)
+                       (geography/site-cost ridge-seed
+                                            (- (cast f64
+                                                     (load (field candidate x)))
+                                               (cast f64
+                                                     (load (field center x))))
+                                            (- (cast f64
+                                                     (load (field candidate z)))
+                                               (cast f64
+                                                     (load (field center z))))))]
+              (if (> (* radius radius) (+ (load best-score) 0.0001))
+                  (break 0)
+                  0)
+              ;; Buildings within one source file share a compact neighborhood.
+              ;; A wider inter-file corridor makes those neighborhoods legible
+              ;; without changing glyph sizes or inventing dependency edges.
+              ;; Historical reservations participate in both clearances so a
+              ;; removed building cannot have its site consumed by another file.
+              (if (and (< lower-bound (load best-score))
+                       (>= (r/distance2 candidate center) 49.0)
+                       (>= (spatial/nearest-squared (load indexed)
+                                                    candidate
+                                                    5.29)
+                           5.29)
+                       (>= (spatial/nearest-squared (load districts)
+                                                    candidate
+                                                    12.96)
+                           12.96))
+                  (let [needed
+                          (if (<= (r/distance2 candidate center)
+                                  (* capacity capacity))
+                              (load (field module radius))
+                              (land/required-site-radius seed
+                                                         (- (cast f64
+                                                                  (load (field candidate
+                                                                               x)))
+                                                            (cast f64
+                                                                  (load (field center
+                                                                               x))))
+                                                         (- (cast f64
+                                                                  (load (field candidate
+                                                                               z)))
+                                                            (cast f64
+                                                                  (load (field center
+                                                                               z))))))
+                        growth
+                          (* (* (land/plateau-scale) (land/plateau-scale))
+                             (- (* needed needed)
+                                (* (load (field module radius))
+                                   (load (field module radius)))))
+                        score
+                          (+ lower-bound (* 4.0 (if (> growth 0.0) growth 0.0)))]
+                    (if (< score (load best-score))
+                        (do (store! result candidate) (store! best-score score))
+                        0))
+                  0))
+        (store! attempt (+ (load attempt) 1)))
+      (al/al-free! (mut indexed))
+      (al/al-free! (mut districts))
+      (al/al-free! (mut sites))
+      (al/al-free! (mut other-files))
+      (load result))))
+
+;;; Pack immutable history-wide footprints before the first frame. Revisions
+;;; then share this geography; differing module sizes cannot overlap neighbors.
+(defn pack! [(world (ptr World))] (-> i64)
+  (pack-folder! world 0)
+  (place-folder! world 0 (r/v3 0.0 0.0 0.0))
+  (contours/bake! (field world folders)))
+
+;;; Terrain-guided frontier growth uses circular bounds only for clearance.
+;;; The visible territory follows its children, not this internal envelope.
+;;; Unsupported files receive no fictional terrain or declarations.
+(defn pack-folder! [(world (ptr World)) (at i64)] (-> i64)
+  (let [nodes (field (field world folders) nodes)
+        (mut children) (al/al-new [i64] (alloc/malloc-allocator))
+        (mut i) (+ at 1)
+        (mut bound) 0.0]
+    (loop (if (>= (load i) (al/al-len (load nodes))) (break 0) 0)
+      (let [n (al/al-get (load nodes) (load i))]
+        (if (= (load (field n parent)) at)
+            (do
+              (if (load (field n directory))
+                  (pack-folder! world (load i))
+                  (if (>= (load (field n island)) 0)
+                      (let [island
+                              (al/al-get (load (field world islands))
+                                         (load (field n island)))]
+                        (store! (field (al/al-elem [folders/Node]
+                                                   nodes
+                                                   (load i))
+                                       radius)
+                                (+ 2.0
+                                   (* (land/main-coast-bound)
+                                      (load (field island radius))))))
+                      0))
+              (let [ready (al/al-get (load nodes) (load i))]
+                (if (> (load (field ready radius)) 0.0)
+                    (al/al-push! (mut children) (load i))
+                    0))
+              0)
+            0))
+      (store! i (+ (load i) 1)))
+    ; Largest-first packing, deterministic path order for equal footprints.
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load children))) (break 0) 0)
+      (let [(mut best) (load i)
+            (mut j) (+ (load i) 1)]
+        (loop (if (>= (load j) (al/al-len (load children))) (break 0) 0)
+          (let [candidate
+                  (al/al-get (load nodes) (al/al-get (load children) (load j)))
+                current
+                  (al/al-get (load nodes)
+                             (al/al-get (load children) (load best)))]
+            (if (> (load (field candidate radius))
+                   (load (field current radius)))
+                (store! best (load j))
+                0))
+          (store! j (+ (load j) 1)))
+        (let [old (al/al-get (load children) (load i))]
+          (store! (al/al-elem [i64] (mut children) (load i))
+                  (al/al-get (load children) (load best)))
+          (store! (al/al-elem [i64] (mut children) (load best)) old)))
+      (let [node
+              (al/al-elem [folders/Node]
+                          nodes
+                          (al/al-get (load children) (load i)))
+            radius (load (field node radius))
+            parent (al/al-get (load nodes) at)
+            position
+              (organic/frontier (load nodes)
+                                (load children)
+                                (load i)
+                                (m/stable-hash (load (field parent path)))
+                                radius)
+            distance (r/sqrt (r/distance2 position (r/v3 0.0 0.0 0.0)))]
+        (store! (field node position) position)
+        (if (> (+ distance radius) (load bound))
+            (store! bound (+ distance radius))
+            0))
+      (store! i (+ (load i) 1)))
+    (store! (field (al/al-elem [folders/Node] nodes at) radius)
+            (organic/envelope-radius (load bound)))
+    (al/al-free! (mut children))
+    0))
+
+(defn place-folder! [(world (ptr World)) (at i64) (position r/Vector3)] (-> i64)
+  (let [nodes (field (field world folders) nodes)
+        node (al/al-elem [folders/Node] nodes at)
+        (mut i) (+ at 1)]
+    (store! (field node position) position)
+    (if (>= (load (field node island)) 0)
+        (move-island! world (load (field node island)) position)
+        0)
+    (loop (if (>= (load i) (al/al-len (load nodes))) (break 0) 0)
+      (let [child (al/al-get (load nodes) (load i))
+            p (load (field child position))]
+        (if (= (load (field child parent)) at)
+            (place-folder! world
+                           (load i)
+                           (r/v3 (+ (cast f64 (load (field position x)))
+                                    (cast f64 (load (field p x))))
+                                 0.0
+                                 (+ (cast f64 (load (field position z)))
+                                    (cast f64 (load (field p z))))))
+            0))
+      (store! i (+ (load i) 1)))
+    0))
+
+;;; Put the largest module at the center without changing module identities.
+(defn hub-index [(world (ptr World))] (-> i64)
+  (let [(mut best) 0
+        (mut count) -1
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field world islands))))
+              (break (load best))
+              0)
+      (let [island (al/al-get (load (field world islands)) (load i))]
+        (if (> (load (field island count)) (load count))
+            (do
+              (store! count (load (field island count)))
+              (store! best (load i)))
+            0))
+      (store! i (+ (load i) 1)))))
+
+(defn placement-index [(step i64) (hub i64) (start i64)] (-> i64)
+  (if (> start 0)
+      step
+      (cond (= step 0) hub (<= step hub) (- step 1) :else step)))
+
+(defn pack-from! [(world (ptr World)) (start i64)] (-> i64)
+  (let [(mut i) start
+        hub (hub-index world)
+        n (al/al-len (load (field world islands)))]
+    (loop (if (>= (load i) n) (break 0) 0)
+      (let [at (placement-index (load i) hub start)
+            island (al/al-elem [m/Island] (field world islands) at)
+            radius (load (field island radius))
+            (mut attempt) 0
+            (mut position) (r/v3 0.0 0.0 0.0)]
+        (loop (let [distance (* 2.0 (r/sqrt (cast f64 (load attempt))))
+                    angle
+                      (+ (* (cast f64 (load attempt)) 2.39996323)
+                         (* (cast f64 (% (load (field island seed)) 101))
+                            0.0622))
+                    candidate
+                      (r/v3 (* distance (r/cos angle))
+                            0.0
+                            (* distance (r/sin angle)))
+                    (mut j) 0
+                    (mut fits) true]
+                (loop (if (>= (load j) (load i)) (break 0) 0)
+                  (let [other
+                          (al/al-get (load (field world islands))
+                                     (placement-index (load j) hub start))
+                        minimum
+                          (+ 2.5
+                             (* (land/main-coast-bound)
+                                (+ radius (load (field other radius)))))]
+                    (if (< (r/distance2 candidate (load (field other position)))
+                           (* minimum minimum))
+                        (store! fits false)
+                        0))
+                  (store! j (+ (load j) 1)))
+                (if (load fits) (do (store! position candidate) (break 0)) 0))
+          (store! attempt (+ (load attempt) 1)))
+        (move-island! world at (load position)))
+      (store! i (+ (load i) 1)))
+    0))
+
+;;; Translate an island as a rigid body: durable entities retain local slots.
+(defn move-island! [(world (ptr World)) (at i64) (position r/Vector3)] (-> i64)
+  (let [island (al/al-elem [m/Island] (field world islands) at)
+        old (load (field island position))
+        dx
+          (- (cast f64 (load (field position x)))
+             (cast f64 (load (field old x))))
+        dz
+          (- (cast f64 (load (field position z)))
+             (cast f64 (load (field old z))))
+        (mut i) 0]
+    (store! (field island position) position)
+    (loop (if (>= (load i) (al/al-len (load (field world registry))))
+              (break 0)
+              0)
+      (let [entity (al/al-elem [m/Entity] (field world registry) (load i))
+            p (load (field entity position))]
+        (if (= (load (field entity island)) at)
+            (store! (field entity position)
+                    (r/v3 (+ (cast f64 (load (field p x))) dx)
+                          2.0
+                          (+ (cast f64 (load (field p z))) dz)))
+            0))
+      (store! i (+ (load i) 1)))
+    0))
+
+(defn footprint-fits? [(world (ptr World))
+                       (at i64)
+                       (position r/Vector3)
+                       (count i64)] (-> bool)
+  (let [island (al/al-get (load (field world islands)) at)
+        (mut i) 0]
+    (loop (if (>= (load i) count) (break true) 0)
+      (if (!= (load i) at)
+          (let [other (al/al-get (load (field world islands)) (load i))
+                minimum
+                  (+ 2.5
+                     (* (land/main-coast-bound)
+                        (+ (load (field island radius))
+                           (load (field other radius)))))]
+            (if (< (r/distance2 position (load (field other position)))
+                   (* minimum minimum))
+                (break false)
+                0))
+          0)
+      (store! i (+ (load i) 1)))))
+
+;;; Append live sites, then repair only enlarged hierarchical reservations.
+;;; The worker owns all topology and placement updates until publication.
+(defn register-live! [(world (ptr World)) (snapshot (ptr m/Snapshot))] (-> i64)
+  (let [count (al/al-len (load (field world registry)))
+        nodes (field (field world folders) nodes)
+        (mut radii) (al/al-new [f64] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load nodes))) (break 0) 0)
+      (let [node (al/al-get (load nodes) (load i))]
+        (al/al-push! (mut radii) (load (field node radius))))
+      (store! i (+ (load i) 1)))
+    (register! world snapshot)
+    (let [changed (!= count (al/al-len (load (field world registry))))]
+      (if changed
+          (do
+            ; Reverse order retains each parent's old world coordinates until
+            ; all of its children have been converted to local coordinates.
+            (store! i (- (al/al-len (load nodes)) 1))
+            (loop (if (<= (load i) 0) (break 0) 0)
+              (let [node (al/al-elem [folders/Node] nodes (load i))
+                    parent (al/al-get (load nodes) (load (field node parent)))
+                    p (load (field node position))
+                    origin (load (field parent position))]
+                (store! (field node position)
+                        (if (< (load i) (al/al-len (load radii)))
+                            (r/v3 (- (cast f64 (load (field p x)))
+                                     (cast f64 (load (field origin x))))
+                                  0.0
+                                  (- (cast f64 (load (field p z)))
+                                     (cast f64 (load (field origin z)))))
+                            (r/v3 0.0 0.0 0.0))))
+              (store! i (- (load i) 1)))
+            (grow-folder! world 0 (load radii))
+            (place-folder! world 0 (r/v3 0.0 0.0 0.0)))
+          0)
+      (if (or changed (!= (al/al-len (load nodes)) (al/al-len (load radii))))
+          (contours/bake! (field world folders))
+          0)
+      (apply-layout! world snapshot)
+      (al/al-free! (mut radii))
+      (if changed 1 0))))
+
+;;; Live expansion moves only children whose enlarged reservation collides.
+;;; Unchanged siblings keep their positions; descendants move rigidly with a
+;;; relocated parent. History scrubbing never calls this routine.
+(defn grow-folder! [(world (ptr World)) (at i64) (old (al/ArrayList f64))] (-> i64)
+  (let [nodes (field (field world folders) nodes)
+        (mut children) (al/al-new [i64] (alloc/malloc-allocator))
+        (mut i) (+ at 1)
+        (mut bound) 0.0]
+    (loop (if (>= (load i) (al/al-len (load nodes))) (break 0) 0)
+      (let [node (al/al-elem [folders/Node] nodes (load i))]
+        (if (= (load (field node parent)) at)
+            (do
+              (if (load (field node directory))
+                  (grow-folder! world (load i) old)
+                  (if (>= (load (field node island)) 0)
+                      (let [island
+                              (al/al-get (load (field world islands))
+                                         (load (field node island)))]
+                        (store! (field node radius)
+                                (+ 2.0
+                                   (* (land/main-coast-bound)
+                                      (load (field island radius))))))
+                      0))
+              (if (> (load (field node radius)) 0.0)
+                  (al/al-push! (mut children) (load i))
+                  0)
+              0)
+            0))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load children))) (break 0) 0)
+      (let [index (al/al-get (load children) (load i))
+            node (al/al-elem [folders/Node] nodes index)
+            radius (load (field node radius))
+            origin (load (field node position))
+            previous (if (< index (al/al-len old)) (al/al-get old index) 0.0)
+            (mut attempt) 0]
+        (if (> radius previous)
+            (loop (let [parent (al/al-get (load nodes) at)
+                        offset
+                          (organic/offset (m/stable-hash (load (field parent
+                                                                      path)))
+                                          (load attempt)
+                                          (+ 20.0 (* 2.0 radius)))
+                        p
+                          (r/v3 (+ (cast f64 (load (field origin x)))
+                                   (cast f64 (load (field offset x))))
+                                0.0
+                                (+ (cast f64 (load (field origin z)))
+                                   (cast f64 (load (field offset z)))))
+                        (mut j) 0
+                        (mut fits) true]
+                    (loop (if (>= (load j) (al/al-len (load children)))
+                              (break 0)
+                              0)
+                      (let [other-index (al/al-get (load children) (load j))
+                            other (al/al-get (load nodes) other-index)]
+                        (if (and (!= other-index index)
+                                 (or (< (load j) (load i))
+                                     (and (< other-index (al/al-len old))
+                                          (> (al/al-get old other-index) 0.0))))
+                            (let [minimum
+                                    (+ 4.0
+                                       (+ radius (load (field other radius))))]
+                              (if (< (r/distance2 p
+                                                  (load (field other position)))
+                                     (* minimum minimum))
+                                  (store! fits false)
+                                  0))
+                            0))
+                      (store! j (+ (load j) 1)))
+                    (if (load fits)
+                        (do (store! (field node position) p) (break 0))
+                        0))
+              (store! attempt (+ (load attempt) 1)))
+            0)
+        (let [needed
+                (+ radius
+                   (r/sqrt (r/distance2 (load (field node position))
+                                        (r/v3 0.0 0.0 0.0))))]
+          (if (> needed (load bound)) (store! bound needed) 0)))
+      (store! i (+ (load i) 1)))
+    (let [required (organic/envelope-radius (load bound))
+          previous (if (< at (al/al-len old)) (al/al-get old at) 0.0)]
+      (store! (field (al/al-elem [folders/Node] nodes at) radius)
+              (if (> required previous) required previous)))
+    (al/al-free! (mut children))
+    0))
+
+(defstruct Placement [(position r/Vector3) (island i64)])
+
+(defstruct SiteKey [(id i64) (path (slice u8))])
+
+(defn site-key [(e m/Entity)] (-> SiteKey)
+  (SiteKey :id (load (field e id)) :path (load (field e path))))
+
+(defn site-hash [(raw (ptr i8)) (size i64)] (-> i64)
+  (let [key (cast (ptr SiteKey) raw)]
+    (primitive/ixor (load (field key id))
+                    (str/str-hash (load (field key path))))))
+
+(defn site-equal [(a (ptr i8)) (b (ptr i8)) (size i64)] (-> bool)
+  (let [x (cast (ptr SiteKey) a)
+        y (cast (ptr SiteKey) b)]
+    (and (= (load (field x id)) (load (field y id)))
+         (str/str-eq (load (field x path)) (load (field y path))))))
+
+(defn site-ops [] (-> hm/KeyOps)
+  (let [(mut ops) (zeroed hm/KeyOps)]
+    (store! (field ops hash) (primitive/fnptr-of site-hash))
+    (store! (field ops eq) (primitive/fnptr-of site-equal))
+    (store! (field ops size) (primitive/sizeof SiteKey))
+    (load ops)))
+
+(defn find-site [(entities (al/ArrayList m/Entity)) (entity m/Entity)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len entities)) (break -1) 0)
+      (let [e (al/al-get entities (load i))]
+        (if (and (= (load (field e id)) (load (field entity id)))
+                 (str/str-eq (load (field e path)) (load (field entity path))))
+            (break (load i))
+            0))
+      (store! i (+ (load i) 1)))))
+
+(defn apply-layout! [(world (ptr World)) (snapshot (ptr m/Snapshot))] (-> i64)
+  (if (= (al/al-len (load (field snapshot entities))) 0)
+      0
+      (let [(mut i) 0
+            (mut ops) (site-ops)
+            (mut positions)
+              (hm/hm-new [SiteKey Placement] (alloc/malloc-allocator) (mut ops))
+            registry (load (field world registry))]
+        (loop (if (>= (load i) (al/al-len registry)) (break 0) 0)
+          (let [e (al/al-get registry (load i))]
+            (match (hm/hm-get (load positions) (site-key e))
+              (Some [_] 0)
+              (None []
+                    (hm/hm-put! (mut positions)
+                                (site-key e)
+                                (Placement :position (load (field e position))
+                                  :island (load (field e island)))))))
+          (store! i (+ (load i) 1)))
+        (store! i 0)
+        (loop (if (>= (load i) (al/al-len (load (field snapshot entities))))
+                  (break 0)
+                  0)
+          (let [entity
+                  (al/al-elem [m/Entity] (field snapshot entities) (load i))]
+            (match (hm/hm-get (load positions) (site-key (load entity)))
+              (Some [placement]
+                    (let [site placement]
+                      (store! (field entity position)
+                              (load (field site position)))
+                      (store! (field entity island) (load (field site island)))
+                      0))
+              (None [] 0)))
+          (store! i (+ (load i) 1)))
+        (hm/hm-free! (mut positions))
+        0)))
+
+(defn register! [(world (ptr World)) (snapshot (ptr m/Snapshot))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field snapshot paths))))
+              (break 0)
+              0)
+      (folders/register! (field world folders)
+                         (al/al-get (load (field snapshot paths)) (load i)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field snapshot sources))))
+              (break 0)
+              0)
+      (let [source (al/al-get (load (field snapshot sources)) (load i))]
+        (folders/register! (field world folders) (load (field source path))))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field snapshot entities))))
+              (break 0)
+              0)
+      (let [entity (al/al-elem (field snapshot entities) (load i))
+            name (load (field entity path))
+            found (find-island world name)
+            island-index
+              (if (>= found 0)
+                  found
+                  (let [index (al/al-len (load (field world islands)))
+                        a (* (cast f64 (% (- index 1) 6)) 1.047197551)
+                        dist
+                          (if (= index 0)
+                              0.0
+                              (* 21.0 (cast f64 (+ 1 (/ (- index 1) 6)))))]
+                    (al/al-push! (mut (field world islands))
+                                 (m/Island
+                                   :name
+                                     (m/copy-text (load (field (field world
+                                                                      islands)
+                                                               alc))
+                                                  name)
+                                   :seed (m/stable-hash name)
+                                   :position
+                                     (r/v3 (* dist (r/cos a))
+                                           0.0
+                                           (* dist (r/sin a)))
+                                   :radius 7.2
+                                   :count 0
+                                   :changed 0))
+                    index))
+            existing (find-site (load (field world registry)) (load entity))
+            node (folders/register! (field world folders) name)]
+        (store! (field (al/al-elem [folders/Node]
+                                   (field (field world folders) nodes)
+                                   node)
+                       island)
+                island-index)
+        (store! (field entity island) island-index)
+        (if (< existing 0)
+            (let [island (al/al-elem (field world islands) island-index)
+                  slot (load (field island count))
+                  position
+                    (settlement-position world
+                                         snapshot
+                                         (load entity)
+                                         island-index)
+                  center (load (field island position))]
+              (store! (field entity position) position)
+              (store! (field island count) (+ slot 1))
+              (let [required
+                      (land/required-site-radius (* (cast f64
+                                                          (% (load (field island
+                                                                          seed))
+                                                             997))
+                                                    0.019)
+                                                 (- (cast f64
+                                                          (load (field position
+                                                                       x)))
+                                                    (cast f64
+                                                          (load (field center x))))
+                                                 (- (cast f64
+                                                          (load (field position
+                                                                       z)))
+                                                    (cast f64
+                                                          (load (field center z)))))]
+                (if (> required (load (field island radius)))
+                    (store! (field island radius) required)
+                    0))
+              (al/al-push! (mut (field world registry))
+                           (m/copy-entity (load (field (field world registry)
+                                                       alc))
+                                          (load entity))))
+            (let [known (al/al-get (load (field world registry)) existing)]
+              (store! (field entity position) (load (field known position))))))
+      (store! i (+ (load i) 1)))
+    0))
+
+;;; Indexed reconciliation keeps exact-match and unambiguous rename semantics.
+;;; Shared mode is only for immutable history with a common lifetime. Live jobs
+;;; still copy all previous metadata before their alternating arenas are reused.
+(defn reconcile! [(before (ptr m/Snapshot)) (after (ptr m/Snapshot))] (-> i64)
+  (reconcile-owned! before after false))
+
+(defn declaration-key [(e m/Entity)] (-> impact/NameKey)
+  (impact/NameKey :module (load (field e path)) :name (load (field e name))))
+
+(defn shape-key [(e m/Entity)] (-> i64)
+  (+ (* (load (field e shape)) 7) (load (field e kind))))
+
+(defn unique-shape! [(table (ptr (hm/HashMap i64 i64))) (key i64) (value i64)] (-> i64)
+  (hm/hm-put! table
+              key
+              (match (hm/hm-get (load table) key) (Some [_] -2) (None [] value))))
+
+(defn reconcile-owned! [(before (ptr m/Snapshot))
+                        (after (ptr m/Snapshot))
+                        (shared bool)] (-> i64)
+  (let [old (load (field before entities))
+        a (alloc/malloc-allocator)
+        (mut ops) (zeroed hm/KeyOps)
+        (mut i) 0]
+    (store! (field ops hash) (primitive/fnptr-of impact/name-hash))
+    (store! (field ops eq) (primitive/fnptr-of impact/name-equal))
+    (store! (field ops size) (primitive/sizeof impact/NameKey))
+    (let [(mut old-names) (hm/hm-new [impact/NameKey i64] a (mut ops))
+          (mut new-names) (hm/hm-new [impact/NameKey i64] a (mut ops))
+          (mut old-shapes) (hm/hm-new-scalar [i64 i64] a)
+          (mut new-shapes) (hm/hm-new-scalar [i64 i64] a)
+          (mut ids) (hm/hm-new-scalar [i64 i64] a)
+          (mut remaps) (hm/hm-new-scalar [i64 i64] a)]
+      (loop (if (>= (load i) (al/al-len old)) (break 0) 0)
+        (let [e (al/al-get old (load i))
+              key (declaration-key e)]
+          (if (and (!= (load (field e state)) 3)
+                   (< (impact/name-value (load old-names) key) 0))
+              (hm/hm-put! (mut old-names) key (load i))
+              0))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len (load (field after entities))))
+                (break 0)
+                0)
+        (let [e (al/al-get (load (field after entities)) (load i))
+              key (declaration-key e)]
+          (if (< (impact/name-value (load new-names) key) 0)
+              (hm/hm-put! (mut new-names) key (load i))
+              0)
+          (if (< (impact/name-value (load old-names) key) 0)
+              (unique-shape! (mut new-shapes) (shape-key e) (load i))
+              0))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len old)) (break 0) 0)
+        (let [e (al/al-get old (load i))]
+          (if (and (!= (load (field e state)) 3)
+                   (< (impact/name-value (load new-names) (declaration-key e))
+                      0))
+              (unique-shape! (mut old-shapes) (shape-key e) (load i))
+              0))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len (load (field after entities))))
+                (break 0)
+                0)
+        (let [e (al/al-elem [m/Entity] (field after entities) (load i))
+              exact
+                (impact/name-value (load old-names) (declaration-key (load e)))
+              shape (shape-key (load e))
+              unique-new
+                (match (hm/hm-get (load new-shapes) shape)
+                  (Some [at] at)
+                  (None [] -1))
+              at
+                (if (>= exact 0)
+                    exact
+                    (if (>= unique-new 0)
+                        (match (hm/hm-get (load old-shapes) shape)
+                          (Some [at] at)
+                          (None [] -1))
+                        -1))]
+          (store! (field e previous-known) true)
+          (store! (field e previous-source) "")
+          (store! (field e previous-details-known) true)
+          (if (>= at 0)
+              (let [previous (al/al-get old at)
+                    generated (load (field e id))
+                    durable (load (field previous id))]
+                (store! (field e id) durable)
+                (if (!= generated durable)
+                    (hm/hm-put! (mut remaps) generated durable)
+                    0)
+                (store! (field e previous-details-known)
+                        (load (field previous details-known)))
+                (store! (field e previous-details)
+                        (if shared
+                            (load (field previous details))
+                            (m/copy-details (load (field after alc))
+                                            (load (field previous details)))))
+                (store! (field e previous-source)
+                        (if shared
+                            (load (field previous source))
+                            (m/copy-text (load (field after alc))
+                                         (load (field previous source))))))
+              0)
+          (hm/hm-put! (mut ids) (load (field e id)) (load i))
+          (store! (field e state)
+                  (if (< at 0)
+                      2
+                      (let [previous (al/al-get old at)]
+                        (if (= (load (field e fingerprint))
+                               (load (field previous fingerprint)))
+                            0
+                            1))))
+          (m/compare-members! e (load (field after alc))))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len (load (field after references))))
+                (break 0)
+                0)
+        (let [ref (al/al-elem [m/Reference] (field after references) (load i))]
+          (match (hm/hm-get (load remaps) (load (field ref source)))
+            (Some [id] (store! (field ref source) id))
+            (None [] 0)))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len old)) (break 0) 0)
+        (let [(mut e) (al/al-get old (load i))
+              found
+                (match (hm/hm-get (load ids) (load (field e id)))
+                  (Some [_] true)
+                  (None [] false))]
+          (if (and (!= (load (field e state)) 3) (not found))
+              (do
+                (store! (field e state) 3)
+                (store! (field e previous-known) true)
+                (store! (field e previous-source) (load (field e source)))
+                (store! (field e previous-details) (load (field e details)))
+                (store! (field e previous-details-known)
+                        (load (field e details-known)))
+                (store! (field e detail-changes)
+                        (al/al-new [m/MemberDelta] (load (field after alc))))
+                (al/al-push! (field after entities)
+                             (if shared
+                                 (load e)
+                                 (m/copy-entity (load (field after alc))
+                                                (load e))))
+                (m/compare-members! (al/al-elem [m/Entity]
+                                                (field after entities)
+                                                (- (al/al-len (load (field after
+                                                                           entities)))
+                                                   1))
+                                    (load (field after alc))))
+              0))
+        (store! i (+ (load i) 1)))
+      (hm/hm-free! (mut old-names))
+      (hm/hm-free! (mut new-names))
+      (hm/hm-free! (mut old-shapes))
+      (hm/hm-free! (mut new-shapes))
+      (hm/hm-free! (mut ids))
+      (hm/hm-free! (mut remaps))
+      0)))
+
+(defstruct RouteSite [(island i64) (next i64)])
+
+(defn route-head [(heads (hm/HashMap impact/NameKey i64)) (name (slice u8))] (-> i64)
+  (impact/name-value heads (impact/NameKey :module name :name "")))
+
+(defn prepare-routes! [(world (ptr World)) (snapshot (ptr m/Snapshot))] (-> i64)
+  (folders/census! (field world folders) snapshot)
+  (let [a (alloc/malloc-allocator)
+        (mut ops) (zeroed hm/KeyOps)
+        (mut i) 0]
+    (store! (field ops hash) (primitive/fnptr-of impact/name-hash))
+    (store! (field ops eq) (primitive/fnptr-of impact/name-equal))
+    (store! (field ops size) (primitive/sizeof impact/NameKey))
+    (let [(mut heads) (hm/hm-new [impact/NameKey i64] a (mut ops))
+          (mut seen) (hm/hm-new [impact/NameKey i64] a (mut ops))
+          (mut links) (al/al-new [RouteSite] a)
+          (mut pairs) (hm/hm-new-scalar [i64 i64] a)
+          entities (load (field snapshot entities))
+          edges (load (field snapshot edges))
+          stride (+ 1 (al/al-len (load (field world islands))))]
+      (al/al-clear! (field snapshot routes))
+      (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+        (let [e (al/al-get entities (load i))
+              module (load (field e module))
+              key (impact/NameKey :module module :name (load (field e path)))]
+          (if (and (!= (load (field e state)) 3)
+                   (< (impact/name-value (load seen) key) 0))
+              (do
+                (hm/hm-put! (mut seen) key 1)
+                (al/al-push! (mut links)
+                             (RouteSite :island (load (field e island))
+                               :next (route-head (load heads) module)))
+                (hm/hm-put! (mut heads)
+                            (impact/NameKey :module module :name "")
+                            (- (al/al-len (load links)) 1))
+                0)
+              0))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len edges)) (break 0) 0)
+        (let [edge (al/al-get edges (load i))
+              x (find-island world (load (field edge path)))
+              (mut to) (route-head (load heads) (load (field edge target)))]
+          (loop (if (or (< x 0) (< (load to) 0)) (break 0) 0)
+            (let [dest (al/al-get (load links) (load to))
+                  y (load (field dest island))
+                  key (+ (* x stride) y)]
+              (if (!= x y)
+                  (match (hm/hm-get (load pairs) key)
+                    (Some [_] 0)
+                    (None []
+                          (do
+                            (hm/hm-put! (mut pairs) key 1)
+                            (al/al-push! (field snapshot routes)
+                                         (m/ModuleRoute :source x :target y))
+                            0)))
+                  0)
+              (store! to (load (field dest next))))))
+        (store! i (+ (load i) 1)))
+      (hm/hm-free! (mut heads))
+      (hm/hm-free! (mut seen))
+      (hm/hm-free! (mut pairs))
+      (al/al-free! (mut links))
+      0)))
+
+(defn same-paths? [(a (ptr m/Snapshot)) (b (ptr m/Snapshot))] (-> bool)
+  (let [(mut ops) (zeroed hm/KeyOps)
+        (mut i) 0
+        (mut same) true]
+    (store! (field ops hash) (primitive/fnptr-of impact/name-hash))
+    (store! (field ops eq) (primitive/fnptr-of impact/name-equal))
+    (store! (field ops size) (primitive/sizeof impact/NameKey))
+    (let [(mut paths)
+            (hm/hm-new [impact/NameKey i64] (alloc/malloc-allocator) (mut ops))]
+      (loop (if (>= (load i) (al/al-len (load (field a paths)))) (break 0) 0)
+        (hm/hm-put! (mut paths)
+                    (impact/NameKey :module ""
+                      :name (al/al-get (load (field a paths)) (load i)))
+                    1)
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len (load (field b paths)))) (break 0) 0)
+        (if (< (impact/name-value (load paths)
+                                  (impact/NameKey :module ""
+                                    :name
+                                      (al/al-get (load (field b paths))
+                                                 (load i))))
+               0)
+            (store! same false)
+            0)
+        (store! i (+ (load i) 1)))
+      (hm/hm-free! (mut paths)))
+    (and (load same)
+         (= (al/al-len (load (field a paths)))
+            (al/al-len (load (field b paths)))))))
+
+(defn same-snapshot? [(a (ptr m/Snapshot)) (b (ptr m/Snapshot))] (-> bool)
+  (let [aa (load (field a entities))
+        bb (load (field b entities))
+        (mut i) 0
+        (mut count) 0
+        (mut same) true]
+    (loop (if (>= (load i) (al/al-len aa)) (break 0) 0)
+      (let [e (al/al-get aa (load i))]
+        (if (!= (load (field e state)) 3)
+            (do
+              (store! count (+ (load count) 1))
+              (let [at (find-declaration bb e)]
+                (if (< at 0)
+                    (store! same false)
+                    (let [other (al/al-get bb at)]
+                      (if (or (!= (load (field e fingerprint))
+                                  (load (field other fingerprint)))
+                              (!= (load (field e line))
+                                  (load (field other line)))
+                              (not (str/str-eq (load (field e source))
+                                               (load (field other source)))))
+                          (store! same false)
+                          0)))))
+            0))
+      (store! i (+ (load i) 1)))
+    (and (load same) (= (load count) (al/al-len bb)) (same-paths? a b))))

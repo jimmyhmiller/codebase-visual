@@ -1,0 +1,108 @@
+(module atlas.tests.organic)
+(import "atlas.organic" :as organic)
+(import "atlas.contours" :as contours)
+(import "atlas.folders" :as folders)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+
+(defn fixture [(a (dyn alloc/Allocator)) (distance f64)] (-> folders/Tree)
+  (let [(mut tree) (folders/new-tree a)
+        left (folders/register! (mut tree) "src/a.coil")
+        right (folders/register! (mut tree) "src/b.coil")
+        folder (folders/find (mut tree) "src")]
+    (store! (field (al/al-elem [folders/Node] (mut (field tree nodes)) left)
+                   radius)
+            16.0)
+    (let [n (al/al-elem [folders/Node] (mut (field tree nodes)) right)]
+      (store! (field n radius) 8.0)
+      (store! (field n position) (r/v3 distance 0.0 5.0)))
+    (store! (field (al/al-elem [folders/Node] (mut (field tree nodes)) folder)
+                   radius)
+            (organic/envelope-radius (+ 8.0
+                                        (r/sqrt (+ (* distance distance) 25.0)))))
+    (contours/bake! (mut tree))
+    (load tree)))
+
+(deftest placement-fallback-is-deterministic-and-origin-preserving
+         (assert (< (r/distance2 (organic/offset 153 90 30.0)
+                                 (organic/offset 153 90 30.0))
+                    0.000001))
+         (assert (> (r/distance2 (organic/offset 153 90 30.0)
+                                 (organic/offset 731 90 30.0))
+                    1.0))
+         (assert (< (r/distance2 (organic/offset 153 0 30.0) (r/v3 0.0 0.0 0.0))
+                    0.000001)))
+
+(deftest marching-triangles-emits-complete-unambiguous-segments
+         (let [(mut out) (al/al-new [r/Vector3] (alloc/malloc-allocator))]
+           (contours/triangle! (mut out)
+                               (r/v3 0.0 1.0 0.0)
+                               (r/v3 2.0 -1.0 0.0)
+                               (r/v3 0.0 -1.0 2.0))
+           (assert-eq (al/al-len (load out)) 2)
+           (assert (< (r/distance2 (al/al-get (load out) 0) (r/v3 1.0 0.1 0.0))
+                      0.000001))
+           (assert (< (r/distance2 (al/al-get (load out) 1) (r/v3 0.0 0.1 1.0))
+                      0.000001))
+           (contours/triangle! (mut out)
+                               (r/v3 0.0 1.0 0.0)
+                               (r/v3 2.0 1.0 0.0)
+                               (r/v3 0.0 1.0 2.0))
+           (assert-eq (al/al-len (load out)) 2)
+           (al/al-free! (mut out))))
+
+(defn verify-contour [(tree (ptr folders/Tree))] (-> i64)
+  (let [at (folders/find tree "src")
+        node (al/al-get (load (field tree nodes)) at)
+        first (load (field node border-first))
+        count (load (field node border-count))
+        points (load (field tree borders))
+        (mut i) 0]
+    (assert (> count 0))
+    (assert-eq (% count 2) 0)
+    (assert (<= (+ first count) (al/al-len points)))
+    (loop (if (>= (load i) count) (break 0) 0)
+      (let [p (al/al-get points (+ first (load i)))
+            q (al/al-get points (+ first (+ (load i) 1)))
+            length (r/distance2 p q)]
+        (assert (< length 100.0))
+        (assert (>= length 0.0))
+        (assert (< (r/fabs (- (cast f64 (load (field p y))) 0.10)) 0.000001)))
+      (store! i (+ (load i) 2)))
+    0))
+
+(deftest territory-cache-survives-worker-arena-recycling
+         (let [(mut arena) (zeroed scratch/ScratchArena)
+               (mut worker) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (scratch/scratch-init (mut worker) (alloc/malloc-allocator))
+           (let [(mut source)
+                   (fixture (scratch/scratch-allocator (mut worker)) 80.0)
+                 (mut copy)
+                   (folders/copy-tree (mut source)
+                                      (scratch/scratch-allocator (mut arena)))]
+             (scratch/scratch-close! (mut worker))
+             (verify-contour (mut copy)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest disconnected-island-groups-do-not-draw-bridges-across-empty-water
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut tree)
+                   (fixture (scratch/scratch-allocator (mut arena)) 300.0)
+                 at (folders/find (mut tree) "src")
+                 node (al/al-get (load (field tree nodes)) at)
+                 first (load (field node border-first))
+                 count (load (field node border-count))
+                 (mut i) 0]
+             (verify-contour (mut tree))
+             (loop (if (>= (load i) count) (break 0) 0)
+               (let [p
+                       (al/al-get (load (field tree borders))
+                                  (+ first (load i)))
+                     x (cast f64 (load (field p x)))]
+                 (assert (or (< x 80.0) (> x 220.0))))
+               (store! i (+ (load i) 1))))
+           (scratch/scratch-close! (mut arena))))

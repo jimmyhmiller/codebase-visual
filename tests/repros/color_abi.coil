@@ -1,0 +1,10 @@
+(module atlas.repros.color-abi)
+(cimport "raylib.h" :flags ["-I/opt/homebrew/include"] :use [Color GetColor ColorToInt])
+
+(defn pack [(color Color)] (-> i64)
+  (cast i64 (ColorToInt color)))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [color (GetColor (cast u32 (+ (cast i64 argc) 16909060)))]
+    (println "{}" (pack color)))
+  0)

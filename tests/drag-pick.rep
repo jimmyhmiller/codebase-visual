@@ -1,0 +1,10 @@
+# Drag the ground by (80,40), then click Order at its translated screen point.
+c 8
+e 10 7 779 525 0 0
+e 11 6 2 0 0 0
+e 20 7 859 565 0 0
+e 21 5 2 0 0 0
+e 30 6 0 0 0 0
+e 31 5 0 0 0 0
+e 40 2 70 0 0 0
+e 41 1 70 0 0 0

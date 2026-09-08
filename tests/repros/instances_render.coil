@@ -1,0 +1,99 @@
+(module atlas.repros.instances-render)
+(import "atlas.instances" :as instances)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.town" :as town)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+(import "coil.scratch" :as scratch)
+
+;;; Native regression: compare actual instanced and ordinary transformed draws
+;;; using the production vertex shader, including normal transforms and reset.
+(defn render [(model r/Model)
+              (shader r/Shader)
+              (target r/RenderTexture)
+              (matrices (al/ArrayList r/Matrix))
+              (instanced bool)] (-> r/Image)
+  (r/BeginTextureMode target)
+  (r/ClearBackground (r/rgba 0 0 0 255))
+  (r/BeginMode3D (r/orbit-camera (r/v3 0.3 2.5 -0.8) 0.65 0.72 7.0))
+  (if instanced
+      (instances/draw! model
+                       matrices
+                       (r/rgba 255 255 255 255)
+                       shader
+                       (zeroed r/Texture))
+      (glyph/cached-model-scaled model
+                                 (r/v3 0.7 1.99 -0.4)
+                                 1.3
+                                 (r/rgba 255 255 255 255)
+                                 shader
+                                 (zeroed r/Texture)))
+  (r/EndMode3D)
+  (r/EndTextureMode)
+  (r/LoadImageFromTexture (load (field target texture))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (r/SetConfigFlags (cast u32 128))
+  (r/InitWindow 128 128 c"Atlas instancing regression")
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+    (let [a (scratch/scratch-allocator (mut arena))
+          model (town/coarse-mesh)
+          shader
+            (r/LoadShaderFromMemory (str/str->cstr a
+                                                   (include-str "../../assets/shaders/world.vs"))
+                                    c"#version 330\nin vec3 normal; in vec4 color; uniform vec4 colDiffuse; out vec4 finalColor; void main(){ finalColor=vec4((normalize(normal)*0.25+0.65)*color.rgb*colDiffuse.rgb,1.0); }")
+          target (r/LoadRenderTexture 128 128)
+          (mut matrices) (al/al-new [r/Matrix] a)
+          (mut mismatches) 0
+          (mut visible) 0
+          (mut i) 0]
+      (al/al-push! (mut matrices)
+                   (instances/transform 0.7
+                                        (- 1.99 (* 1.99 1.3))
+                                        -0.4
+                                        1.3
+                                        1.3
+                                        1.3))
+      (let [reference (render model shader target (load matrices) false)
+            instanced (render model shader target (load matrices) true)
+            restored (render model shader target (load matrices) false)
+            aa (r/LoadImageColors reference)
+            bb (r/LoadImageColors instanced)
+            cc (r/LoadImageColors restored)]
+        (loop (if (>= (load i) 16384) (break 0) 0)
+          (let [x (load (index aa (load i)))
+                y (load (index bb (load i)))
+                z (load (index cc (load i)))
+                difference
+                  (+ (r/fabs (- (cast f64 (load (field x r)))
+                                (cast f64 (load (field y r)))))
+                     (r/fabs (- (cast f64 (load (field x g)))
+                                (cast f64 (load (field y g))))))]
+            (if (> (load (field x r)) (cast u8 5))
+                (store! visible (+ (load visible) 1))
+                0)
+            (if (or (> difference 8.0)
+                    (!= (load (field x r)) (load (field z r))))
+                (store! mismatches (+ (load mismatches) 1))
+                0))
+          (store! i (+ (load i) 1)))
+        (println "Instancing GPU comparison: {} visible pixels, {} mismatches"
+                 (load visible)
+                 (load mismatches))
+        (r/UnloadImageColors aa)
+        (r/UnloadImageColors bb)
+        (r/UnloadImageColors cc)
+        (r/UnloadImage reference)
+        (r/UnloadImage instanced)
+        (r/UnloadImage restored))
+      (r/UnloadRenderTexture target)
+      (r/UnloadModel model)
+      (r/UnloadShader shader)
+      (let [result
+              (if (and (> (load visible) 300) (< (load mismatches) 16)) 0 1)]
+        (scratch/scratch-close! (mut arena))
+        (r/CloseWindow)
+        result))))

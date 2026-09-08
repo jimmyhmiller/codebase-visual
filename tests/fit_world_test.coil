@@ -1,0 +1,179 @@
+(module atlas.tests.fit-world)
+(import "atlas.view" :as view)
+(import "atlas.world" :as world)
+(import "atlas.folders" :as folders)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+
+(deftest folder-focus-fits-current-visible-islands-not-historical-outliers
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut v) (zeroed view/View)
+                 (mut i) 0]
+             (store! (field v width) 1600)
+             (store! (field v height) 1000)
+             (store! (field v yaw) 0.65)
+             (store! (field v pitch) 0.72)
+             (store! (field v zoom) 1000.0)
+             (store! (field v island-counts) (al/al-new [i64] a))
+             (store! (field (field v folders) islands) (al/al-new [bool] a))
+             (loop (if (>= (load i) 2) (break 0) 0)
+               (let [path (if (= (load i) 0) "src/near.coil" "src/old.coil")
+                     node (folders/register! (mut (field w folders)) path)]
+                 (store! (field (al/al-elem [folders/Node]
+                                            (mut (field (field w folders) nodes))
+                                            node)
+                                island)
+                         (load i))
+                 (al/al-push! (mut (field w islands))
+                              (m/Island
+                                :name path
+                                :seed 1
+                                :count 1
+                                :changed 0
+                                :radius 10.0
+                                :position
+                                  (r/v3 (if (= (load i) 0) 50.0 5000.0)
+                                        0.0
+                                        30.0)))
+                 (al/al-push! (mut (field v island-counts))
+                              (if (= (load i) 0) 1 0)))
+               (store! i (+ (load i) 1)))
+             (let [folder (folders/find (mut (field w folders)) "src")]
+               (view/focus-folder! (mut v) (mut w) folder)
+               (assert (< (load (field v desired-zoom)) 100.0))
+               (assert (< (r/fabs (- (load (field v zoom)) 1000.0)) 0.000001))
+               (store! (al/al-elem [i64] (mut (field v island-counts)) 1) 1)
+               (view/focus-folder! (mut v) (mut w) folder)
+               (assert (> (load (field v desired-zoom)) 1000.0))
+               (al/al-push! (mut (field (field v folders) islands)) true)
+               (al/al-push! (mut (field (field v folders) islands)) false)
+               (view/focus-folder! (mut v) (mut w) folder)
+               (assert (< (load (field v desired-zoom)) 100.0))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest empty-world-fit-restores-a-valid-camera-after-navigation
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut w)
+                   (world/new-world (scratch/scratch-allocator (mut arena)))
+                 (mut v) (zeroed view/View)]
+             (store! (field v width) 1600)
+             (store! (field v height) 1000)
+             (store! (field v yaw) 0.65)
+             (store! (field v pitch) 0.72)
+             (store! (field v cursor-zoom) true)
+             (store! (field v target) (r/v3 80.0 2.0 -50.0))
+             (view/fit-world! (mut v) (mut w))
+             (assert (> (load (field v zoom)) 0.0))
+             (assert (< (r/fabs (- (load (field v zoom)) 40.0)) 0.000001))
+             (assert (< (r/fabs (- (load (field v desired-zoom)) 40.0))
+                        0.000001))
+             (assert (not (load (field v cursor-zoom))))
+             (let [target (load (field v target))]
+               (assert (< (r/distance2 target (r/v3 0.0 0.0 0.0)) 0.000001))
+               (assert (< (r/fabs (cast f64 (load (field target y)))) 0.000001))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest world-fit-is-invariant-under-large-translation
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut v) (zeroed view/View)
+                 (mut island) (zeroed m/Island)]
+             (store! (field v width) 1600)
+             (store! (field v height) 1000)
+             (store! (field v yaw) 0.65)
+             (store! (field v pitch) 0.72)
+             (store! (field island radius) 10.0)
+             (store! (field island position) (r/v3 0.0 0.0 0.0))
+             (al/al-push! (mut (field w islands)) (load island))
+             (view/fit-world! (mut v) (mut w))
+             (let [before (load (field v zoom))
+                   before-target (load (field v target))
+                   entry (al/al-elem [m/Island] (field w islands) 0)]
+               (store! (field entry position) (r/v3 1000000.0 0.0 -1000000.0))
+               (view/fit-world! (mut v) (mut w))
+               (assert (< (r/fabs (- before (load (field v zoom)))) 0.000001))
+               (let [target (load (field v target))]
+                 (assert (< (r/fabs (- (cast f64 (load (field target x)))
+                                       (+ 1000000.0
+                                          (cast f64
+                                                (load (field before-target x))))))
+                            0.2))
+                 (assert (< (r/fabs (- (cast f64 (load (field target z)))
+                                       (+ -1000000.0
+                                          (cast f64
+                                                (load (field before-target z))))))
+                            0.2)))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest world-fit-contains-projected-islands-and-roofs-at-varied-angles
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut w)
+                   (world/new-world (scratch/scratch-allocator (mut arena)))
+                 (mut v) (zeroed view/View)
+                 (mut i) 0]
+             (store! (field v width) 1600)
+             (store! (field v height) 1000)
+             (loop (if (>= (load i) 4) (break 0) 0)
+               (al/al-push! (mut (field w islands))
+                            (m/Island
+                              :name "test"
+                              :seed (load i)
+                              :count 0
+                              :changed 0
+                              :radius (+ 3.0 (* (cast f64 (load i)) 4.0))
+                              :position
+                                (r/v3 (* (cast f64 (load i)) 13.0)
+                                      0.0
+                                      (* (cast f64 (% (load i) 2)) 19.0))))
+               (store! i (+ (load i) 1)))
+             (let [(mut angle) 0]
+               (loop (if (>= (load angle) 12) (break 0) 0)
+                 (let [yaw (* (cast f64 (load angle)) 0.53)
+                       pitch (+ 0.28 (* (cast f64 (% (load angle) 4)) 0.24))]
+                   (store! (field v yaw) yaw)
+                   (store! (field v pitch) pitch)
+                   (view/fit-world! (mut v) (mut w))
+                   (let [target (load (field v target))
+                         tx (cast f64 (load (field target x)))
+                         tz (cast f64 (load (field target z)))
+                         cx (- (* tx (r/cos yaw)) (* tz (r/sin yaw)))
+                         cy
+                           (* (+ (* tx (r/sin yaw)) (* tz (r/cos yaw)))
+                              (r/sin pitch))
+                         half-y (* (load (field v zoom)) 0.44)
+                         half-x (* half-y (/ 1100.0 824.0))]
+                     (store! i 0)
+                     (loop (if (>= (load i) 4) (break 0) 0)
+                       (let [island
+                               (al/al-get (load (field w islands)) (load i))
+                             p (load (field island position))
+                             x (cast f64 (load (field p x)))
+                             z (cast f64 (load (field p z)))
+                             sx (- (* x (r/cos yaw)) (* z (r/sin yaw)))
+                             sy
+                               (* (+ (* x (r/sin yaw)) (* z (r/cos yaw)))
+                                  (r/sin pitch))
+                             radius (* (load (field island radius)) 1.35)]
+                         (assert (<= (+ (r/fabs (- sx cx)) radius)
+                                     (+ half-x 0.00001)))
+                         (assert (>= (- sy
+                                        (+ (* radius (r/sin pitch))
+                                           (* 4.8 (r/cos pitch))))
+                                     (- cy (+ half-y 0.00001))))
+                         (assert (<= (+ sy
+                                        (+ (* radius (r/sin pitch))
+                                           (* 0.5 (r/cos pitch))))
+                                     (+ cy (+ half-y 0.00001)))))
+                       (store! i (+ (load i) 1)))))
+                 (store! angle (+ (load angle) 1)))))
+           (scratch/scratch-close! (mut arena))))

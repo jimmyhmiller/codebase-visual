@@ -1,0 +1,80 @@
+(module atlas.tests.render-scaling)
+(import "atlas.view" :as view)
+(import "atlas.terrain" :as terrain)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(deftest culling-retains-projected-visible-points-at-all-camera-headings
+         (let [(mut v) (zeroed view/View)
+               (mut heading) 0]
+           (store! (field v width) 1600)
+           (store! (field v height) 1000)
+           (store! (field v target) (r/v3 30.0 0.0 -40.0))
+           (store! (field v zoom) 60.0)
+           (loop (if (>= (load heading) 12) (break 0) 0)
+             (store! (field v yaw) (* (cast f64 (load heading)) 0.53))
+             (store! (field v pitch)
+                     (+ 0.3 (* (cast f64 (% (load heading) 5)) 0.2)))
+             (let [camera
+                     (r/orbit-camera (load (field v target))
+                                     (load (field v yaw))
+                                     (load (field v pitch))
+                                     60.0)
+                   (mut i) 0]
+               (loop (if (>= (load i) 400) (break 0) 0)
+                 (let [p
+                         (r/v3 (- (cast f64 (% (* (load i) 37) 200)) 70.0)
+                               3.0
+                               (- (cast f64 (% (* (load i) 59) 200)) 140.0))
+                       projected (r/GetWorldToScreenEx p camera 1100 824)
+                       x (load (field projected x))
+                       y (load (field projected y))]
+                   (if (and (> x 0.0) (< x 1100.0) (> y 0.0) (< y 824.0))
+                       (assert (view/position-visible? (mut v) p 0.01))
+                       0))
+                 (store! i (+ (load i) 1))))
+             (store! heading (+ (load heading) 1)))))
+
+(deftest terrain-chunks-preserve-fine-geometry-and-release-owned-lods
+         (let [(mut islands) (al/al-new [m/Island] (alloc/malloc-allocator))
+               (mut entities) (al/al-new [m/Entity] (alloc/malloc-allocator))
+               (mut island) (zeroed m/Island)]
+           (store! (field island radius) 9.0)
+           (store! (field island seed) 31)
+           (al/al-push! (mut islands) (load island))
+           (store! (field island position) (r/v3 40.0 0.0 0.0))
+           (al/al-push! (mut islands) (load island))
+           (let [(mut full) (terrain/generate (load islands) (load entities))
+                 (mut chunks)
+                   (terrain/generate-chunks (load islands) (load entities))
+                 first (al/al-get (load chunks) 0)
+                 second (al/al-get (load chunks) 1)]
+             (assert-eq (al/al-len (load chunks)) 2)
+             (assert-eq (al/al-len (load full))
+                        (+ (al/al-len (load (field first fine)))
+                           (al/al-len (load (field second fine)))))
+             (assert (> (al/al-len (load (field first coarse))) 0))
+             (assert (< (al/al-len (load (field first coarse)))
+                        (al/al-len (load (field first fine)))))
+             (let [(mut i) 0]
+               (loop (if (>= (load i) (al/al-len (load full))) (break 0) 0)
+                 (let [split (al/al-len (load (field first fine)))
+                       actual
+                         (if (< (load i) split)
+                             (al/al-get (load (field first fine)) (load i))
+                             (al/al-get (load (field second fine))
+                                        (- (load i) split)))
+                       expected (al/al-get (load full) (load i))
+                       a (load (field actual p))
+                       e (load (field expected p))]
+                   (assert (< (r/distance2 a e) 0.0000001))
+                   (assert (< (r/fabs (- (cast f64 (load (field a y)))
+                                         (cast f64 (load (field e y)))))
+                              0.000001)))
+                 (store! i (+ (load i) 1))))
+             (terrain/release-chunks! (mut chunks))
+             (al/al-free! (mut full)))
+           (al/al-free! (mut islands))
+           (al/al-free! (mut entities))))

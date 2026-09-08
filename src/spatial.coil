@@ -1,0 +1,110 @@
+(module atlas.spatial)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+;;; An immutable, balanced 2D kd-tree encoded by median array positions.
+;;; Construction copies its input; it never reorders the caller's site list.
+(defn coordinate [(p r/Vector3) (axis i64)] (-> f64)
+  (if (= axis 0) (cast f64 (load (field p x))) (cast f64 (load (field p z)))))
+
+(defn swap! [(points (ptr (al/ArrayList r/Vector3))) (a i64) (b i64)] (-> i64)
+  (let [value (al/al-get (load points) a)
+        other (al/al-get (load points) b)]
+    (store! (al/al-elem [r/Vector3] points a) other)
+    (store! (al/al-elem [r/Vector3] points b) value)
+    0))
+
+;;; Three-way partition handles identical coordinates without quadratic
+;;; recursion or a non-terminating median selection.
+(defn median! [(points (ptr (al/ArrayList r/Vector3)))
+               (begin i64)
+               (end i64)
+               (nth i64)
+               (axis i64)] (-> i64)
+  (let [(mut low) begin
+        (mut high) end]
+    (loop (if (<= (- (load high) (load low)) 1) (break 0) 0)
+      (let [pivot
+              (coordinate (al/al-get (load points)
+                                     (/ (+ (load low) (load high)) 2))
+                          axis)
+            (mut less) (load low)
+            (mut scan) (load low)
+            (mut greater) (load high)]
+        (loop (if (>= (load scan) (load greater)) (break 0) 0)
+          (let [value (coordinate (al/al-get (load points) (load scan)) axis)]
+            (cond (< value pivot)
+                    (do
+                      (swap! points (load scan) (load less))
+                      (store! less (+ (load less) 1))
+                      (store! scan (+ (load scan) 1)))
+                  (> value pivot)
+                    (do
+                      (store! greater (- (load greater) 1))
+                      (swap! points (load scan) (load greater))
+                      0)
+                  :else (store! scan (+ (load scan) 1)))))
+        (cond (< nth (load less)) (store! high (load less))
+              (>= nth (load greater)) (store! low (load greater))
+              :else (break 0))))
+    0))
+
+(defn partition! [(points (ptr (al/ArrayList r/Vector3)))
+                  (begin i64)
+                  (end i64)
+                  (axis i64)] (-> i64)
+  (if (<= (- end begin) 1)
+      0
+      (let [middle (/ (+ begin end) 2)]
+        (median! points begin end middle axis)
+        (partition! points begin middle (- 1 axis))
+        (partition! points (+ middle 1) end (- 1 axis))
+        0)))
+
+(defn build [(sites (al/ArrayList r/Vector3))
+             (a (dyn alloc/Allocator))] (-> (al/ArrayList r/Vector3))
+  (let [(mut points) (al/al-new [r/Vector3] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len sites)) (break 0) 0)
+      (al/al-push! (mut points) (al/al-get sites (load i)))
+      (store! i (+ (load i) 1)))
+    (partition! (mut points) 0 (al/al-len sites) 0)
+    (load points)))
+
+(defn nearest-in [(points (al/ArrayList r/Vector3))
+                  (p r/Vector3)
+                  (begin i64)
+                  (end i64)
+                  (axis i64)
+                  (bound f64)] (-> f64)
+  (if (>= begin end)
+      bound
+      (let [middle (/ (+ begin end) 2)
+            node (al/al-get points middle)
+            distance (r/distance2 p node)
+            best (if (< distance bound) distance bound)
+            delta (- (coordinate p axis) (coordinate node axis))
+            left (< delta 0.0)
+            near
+              (nearest-in points
+                          p
+                          (if left begin (+ middle 1))
+                          (if left middle end)
+                          (- 1 axis)
+                          best)]
+        (if (< (* delta delta) near)
+            (nearest-in points
+                        p
+                        (if left (+ middle 1) begin)
+                        (if left end middle)
+                        (- 1 axis)
+                        near)
+            near))))
+
+;;; Return min(nearest distance squared, bound). Foundation queries need only
+;;; know whether a site lies inside their finite flattening radius.
+(defn nearest-squared [(points (al/ArrayList r/Vector3))
+                       (p r/Vector3)
+                       (bound f64)] (-> f64)
+  (nearest-in points p 0 (al/al-len points) 0 bound))

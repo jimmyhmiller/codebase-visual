@@ -1,0 +1,11 @@
+# Select Order, focus, then lower the camera to inspect recessed facades.
+c 9
+e 10 7 779 525 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 20 2 70 0 0 0
+e 21 1 70 0 0 0
+e 70 7 700 440 0 0
+e 71 6 1 0 0 0
+e 72 7 770 400 0 0
+e 73 5 1 0 0 0

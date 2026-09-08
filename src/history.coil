@@ -1,0 +1,196 @@
+(module atlas.history)
+(import "atlas.model" :as m)
+(import "atlas.repository" :as git)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.impact" :as impact)
+(import "atlas.world" :as world)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.hashmap" :as hm)
+(import "coil.primitive" :as p)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-new])
+
+;;; A file analysis is immutable and keyed by both Git object and path (adapters
+;;; may derive module/identity from path). All snapshots borrow its metadata.
+;;; The cache and every prepared snapshot share one repository-session lifetime.
+(defstruct Cache
+  [(files (hm/HashMap impact/NameKey m/Snapshot))
+   (alc (dyn alloc/Allocator))
+   (analyses i64)])
+
+(defn new-cache [(a (dyn alloc/Allocator))] (-> Cache)
+  (let [ops (alloc/box! a hm/KeyOps (zeroed hm/KeyOps))]
+    (store! (field ops hash) (p/fnptr-of impact/name-hash))
+    (store! (field ops eq) (p/fnptr-of impact/name-equal))
+    (store! (field ops size) (p/sizeof impact/NameKey))
+    (Cache
+      :files (hm/hm-new [impact/NameKey m/Snapshot] a ops)
+      :alc a
+      :analyses 0)))
+
+(defn append-file! [(sink (ptr m/Snapshot)) (file m/Snapshot)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field file entities))))
+              (break 0)
+              0)
+      (al/al-push! (field sink entities)
+                   (al/al-get (load (field file entities)) (load i)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field file edges)))) (break 0) 0)
+      (al/al-push! (field sink edges)
+                   (al/al-get (load (field file edges)) (load i)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field file references))))
+              (break 0)
+              0)
+      (al/al-push! (field sink references)
+                   (al/al-get (load (field file references)) (load i)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field file sources)))) (break 0) 0)
+      (al/al-push! (field sink sources)
+                   (al/al-get (load (field file sources)) (load i)))
+      (store! i (+ (load i) 1)))
+    (store! (field sink file-count)
+            (+ (load (field sink file-count)) (load (field file file-count))))
+    0))
+
+(defn read-tree! [(cache (ptr Cache))
+                  (registry (ptr analyzer/Registry))
+                  (sink (ptr m/Snapshot))
+                  (repo (ptr git/git_repository))
+                  (tree (ptr git/git_tree))
+                  (prefix (slice u8))] (-> i64)
+  (let [a (load (field cache alc))
+        (mut i) 0]
+    (loop (if (>= (load i) (cast i64 (git/git_tree_entrycount tree)))
+              (break 0)
+              0)
+      (let [entry (git/git_tree_entry_byindex tree (cast u64 (load i)))
+            path
+              (git/concat a
+                          prefix
+                          (str/cstr->str (git/git_tree_entry_name entry)))
+            kind (git/git_tree_entry_type entry)]
+        (if (!= kind (cast i32 2)) (al/al-push! (field sink paths) path) 0)
+        (cond (= kind (cast i32 2))
+                (let [(mut child) (cast (ptr git/git_tree) 0)]
+                  (if (= (git/git_tree_lookup (mut child)
+                                              repo
+                                              (git/git_tree_entry_id entry))
+                         0)
+                      (do
+                        (read-tree! cache
+                                    registry
+                                    sink
+                                    repo
+                                    (load child)
+                                    (git/concat a path "/"))
+                        (git/git_tree_free (load child))
+                        0)
+                      0))
+              (and (= kind (cast i32 3))
+                   (!= (git/git_tree_entry_filemode entry) (cast i32 40960))
+                   (>= (analyzer/lookup registry path) 0))
+                (let [(mut buf) (zeroed (array i8 41))
+                      oid (git/git_tree_entry_id entry)]
+                  (git/git_oid_tostr (index buf 0) (cast u64 41) oid)
+                  (let [key
+                          (impact/NameKey :module path
+                            :name (git/copy a (str/cstr->str (index buf 0))))]
+                    (match (hm/hm-get (load (field cache files)) key)
+                      (Some [file] (append-file! sink file))
+                      (None []
+                            (let [(mut file) (m/new-snapshot a)
+                                  (mut blob) (cast (ptr git/git_blob) 0)]
+                              (if (= (git/git_blob_lookup (mut blob) repo oid)
+                                     0)
+                                  (do
+                                    (let [size
+                                            (cast i64
+                                                  (git/git_blob_rawsize (load blob)))]
+                                      (if (and (= (git/git_blob_is_binary (load blob))
+                                                  0)
+                                               (< size 2000000))
+                                          (analyzer/analyze-registered! registry
+                                                                        (mut file)
+                                                                        path
+                                                                        (git/copy a
+                                                                                  (slice-new (cast (ptr u8)
+                                                                                                   (git/git_blob_rawcontent (load blob)))
+                                                                                             size)))
+                                          0))
+                                    (git/git_blob_free (load blob))
+                                    0)
+                                  0)
+                              (hm/hm-put! (field cache files) key (load file))
+                              (store! (field cache analyses)
+                                      (+ (load (field cache analyses)) 1))
+                              (append-file! sink (load file)))))))
+              :else 0))
+      (store! i (+ (load i) 1)))
+    0))
+
+(defn snapshot! [(cache (ptr Cache))
+                 (registry (ptr analyzer/Registry))
+                 (repo (ptr git/git_repository))
+                 (revision m/Revision)] (-> m/Snapshot)
+  (let [a (load (field cache alc))
+        (mut out) (m/new-snapshot a)
+        (mut oid) (zeroed git/git_oid)
+        (mut commit) (cast (ptr git/git_commit) 0)
+        (mut tree) (cast (ptr git/git_tree) 0)]
+    (store! (field out label) (load (field revision title)))
+    (store! (field out revision) (load (field revision oid)))
+    (if (and (= (git/git_oid_fromstr (mut oid)
+                                     (str/str->cstr a
+                                                    (load (field revision oid))))
+                0)
+             (= (git/git_commit_lookup (mut commit) repo (mut oid)) 0))
+        (do
+          (if (= (git/git_commit_tree (mut tree) (load commit)) 0)
+              (do
+                (read-tree! cache registry (mut out) repo (load tree) "")
+                (git/git_tree_free (load tree))
+                0)
+              0)
+          (git/git_commit_free (load commit))
+          0)
+        0)
+    (load out)))
+
+(defn parent-oid [(a (dyn alloc/Allocator))
+                  (repo (ptr git/git_repository))
+                  (revision m/Revision)] (-> (slice u8))
+  (let [(mut oid) (zeroed git/git_oid)
+        (mut commit) (cast (ptr git/git_commit) 0)
+        (mut parent) (cast (ptr git/git_commit) 0)
+        (mut result) ""
+        (mut buf) (zeroed (array i8 41))]
+    (if (and (= (git/git_oid_fromstr (mut oid)
+                                     (str/str->cstr a
+                                                    (load (field revision oid))))
+                0)
+             (= (git/git_commit_lookup (mut commit) repo (mut oid)) 0))
+        (do
+          (if (and (> (git/git_commit_parentcount (load commit)) (cast u32 0))
+                   (= (git/git_commit_parent (mut parent)
+                                             (load commit)
+                                             (cast u32 0))
+                      0))
+              (do
+                (git/git_oid_tostr (index buf 0)
+                                   (cast u64 41)
+                                   (git/git_commit_id (load parent)))
+                (store! result (git/copy a (str/cstr->str (index buf 0))))
+                (git/git_commit_free (load parent))
+                0)
+              0)
+          (git/git_commit_free (load commit))
+          0)
+        0)
+    (load result)))

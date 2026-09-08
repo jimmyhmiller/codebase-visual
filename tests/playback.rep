@@ -1,0 +1,14 @@
+# Seek to the beginning, set 4x speed, then play history to completion.
+c 12
+e 10 7 250 930 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 20 2 93 0 0 0
+e 21 1 93 0 0 0
+e 25 2 93 0 0 0
+e 26 1 93 0 0 0
+e 30 2 32 0 0 0
+e 31 1 32 0 0 0
+e 32 7 210 80 0 0
+e 300 2 72 0 0 0
+e 301 1 72 0 0 0

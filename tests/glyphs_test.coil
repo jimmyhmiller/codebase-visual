@@ -1,0 +1,13 @@
+(module atlas.tests.glyphs)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+
+(deftest branch-taper-is-positive-and-monotonic
+         (let [(mut depth) 1]
+           (loop (if (> (load depth) 5) (break 0) 0)
+             (let [base (glyph/branch-radius (load depth))
+                   tip (glyph/branch-radius (- (load depth) 1))]
+               (assert (> tip 0.0))
+               (assert (> base tip))
+               (assert (<= base 0.048)))
+             (store! depth (+ (load depth) 1)))))

@@ -1,0 +1,77 @@
+(module atlas.tests.water-mesh)
+(import "atlas.terrain" :as terrain)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(deftest shelf-mesh-is-a-continuous-field-with-upward-winding
+         (let [(mut islands) (al/al-new [m/Island] (alloc/malloc-allocator))
+               island
+                 (m/Island
+                   :name "src/coast.coil"
+                   :seed 43
+                   :position (r/v3 15.0 0.0 -23.0)
+                   :radius 12.0
+                   :count 0
+                   :changed 0)]
+           (al/al-push! (mut islands) island)
+           (let [(mut vertices) (terrain/generate-water (load islands))
+                 (mut i) 0]
+             (assert (> (al/al-len (load vertices)) 0))
+             (assert-eq (% (al/al-len (load vertices)) 3) 0)
+             (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+               (let [v (al/al-get (load vertices) (load i))
+                     p (load (field v p))
+                     expected
+                       (terrain/shelf-vertex island
+                                             (cast f64 (load (field p x)))
+                                             (cast f64 (load (field p z))))]
+                 (assert (> (load (field (field v uv) y)) (cast f32 1.5)))
+                 (assert (< (r/fabs (+ (cast f64 (load (field p y))) 0.46))
+                            0.000001))
+                 (assert (< (r/fabs (- (cast f64 (load (field (field v uv) x)))
+                                       (cast f64
+                                             (load (field (field expected uv) x)))))
+                            0.00001))
+                 (assert (<= (cast i64 (load (field (field v color) a))) 150))
+                 (if (= (% (load i) 3) 0)
+                     (let [vb (al/al-get (load vertices) (+ (load i) 1))
+                           vc (al/al-get (load vertices) (+ (load i) 2))
+                           b (load (field vb p))
+                           c (load (field vc p))
+                           bx
+                             (- (cast f64 (load (field b x)))
+                                (cast f64 (load (field p x))))
+                           bz
+                             (- (cast f64 (load (field b z)))
+                                (cast f64 (load (field p z))))
+                           cx
+                             (- (cast f64 (load (field c x)))
+                                (cast f64 (load (field p x))))
+                           cz
+                             (- (cast f64 (load (field c z)))
+                                (cast f64 (load (field p z))))]
+                       (assert (> (- (* bz cx) (* bx cz)) 0.0)))
+                     0))
+               (store! i (+ (load i) 1)))
+             (al/al-free! (mut vertices)))
+           (al/al-free! (mut islands))))
+
+(deftest ordinary-geometry-does-not-enable-coastal-contours
+         (let [(mut vertices)
+                 (al/al-new [terrain/Vertex] (alloc/malloc-allocator))]
+           (terrain/append! (mut vertices)
+                            (r/v3 0.0 0.0 0.0)
+                            (r/rgba 255 255 255 255))
+           (terrain/append-normal! (mut vertices)
+                                   (r/v3 1.0 0.0 0.0)
+                                   (r/v3 0.0 1.0 0.0)
+                                   (r/rgba 255 255 255 255))
+           (let [a (al/al-get (load vertices) 0)
+                 b (al/al-get (load vertices) 1)]
+             (assert (< (r/fabs (cast f64 (load (field (field a uv) y))))
+                        0.000001))
+             (assert (< (r/fabs (cast f64 (load (field (field b uv) y))))
+                        0.000001)))
+           (al/al-free! (mut vertices))))

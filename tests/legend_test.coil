@@ -1,0 +1,35 @@
+(module atlas.tests.legend)
+(import "atlas.view" :as view)
+(import "atlas.ray" :as r)
+
+(deftest map-overlays-fit-and-do-not-overlap-at-supported-sizes
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 4) (break 0) 0)
+             (let [width (+ 1100.0 (* (cast f64 (load i)) 250.0))
+                   height (+ 720.0 (* (cast f64 (load i)) 100.0))
+                   key (view/legend-bounds width height)
+                   source (view/source-bounds width height true)
+                   x (cast f64 (load (field key x)))
+                   y (cast f64 (load (field key y)))]
+               (assert (> x 200.0))
+               (assert (< (+ x (cast f64 (load (field key width))))
+                          (- width 300.0)))
+               (assert (< (+ y (cast f64 (load (field key height))))
+                          (- height 100.0)))
+               (assert (< (+ (cast f64 (load (field source y)))
+                             (cast f64 (load (field source height))))
+                          y))
+               (assert (view/inside-panel? (r/v2 (+ x 3.0) (+ y 3.0)) key))
+               (assert (not (view/inside-panel? (r/v2 (- x 1.0) y) key)))
+               (assert (not (view/inside-panel? (r/v2 x (+ y 56.0)) key))))
+             (store! i (+ (load i) 1)))))
+
+(deftest collapsed-source-only-captures-visible-header
+         (let [closed (view/source-bounds 1600.0 1000.0 false)
+               open (view/source-bounds 1600.0 1000.0 true)]
+           (assert (view/inside-panel? (r/v2 500.0 700.0) open))
+           (assert (not (view/inside-panel? (r/v2 500.0 700.0) closed)))
+           (assert (view/inside-panel? (r/v2 500.0 800.0) closed))
+           (assert (view/inside-panel? (r/v2 500.0 800.0) open))
+           (assert (not (view/inside-panel? (r/v2 500.0 816.0) closed)))
+           (assert (not (view/inside-panel? (r/v2 500.0 816.0) open)))))

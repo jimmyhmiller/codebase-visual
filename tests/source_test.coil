@@ -1,0 +1,78 @@
+(module atlas.tests.source)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.world" :as world)
+(import "atlas.view" :as view)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+
+(deftest source-rows-preserve-utf8-boundaries
+         (assert-eq (view/source-row-end "aé日z" 0 2) 3)
+         (assert-eq (view/source-row-end "aé日z" 3 1) 6)
+         (assert-eq (view/source-row-end "a\nb" 0 10) 1)
+         (assert-eq (view/source-row-end "" 0 10) 0))
+
+(deftest comparisons-own-the-immediately-previous-source
+         (let [(mut old-arena) (zeroed scratch/ScratchArena)
+               (mut new-arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut old-arena) (alloc/malloc-allocator))
+           (scratch/scratch-init (mut new-arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut old-arena))
+                 b (scratch/scratch-allocator (mut new-arena))
+                 first-source "(defstruct Order [(id i64)])"
+                 second-source "(defstruct Order [(id i64) (priority i64)])"
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot b)]
+             (analyzer/analyze-source! (mut before)
+                                       "order.coil"
+                                       (m/copy-text a first-source))
+             (let [initial (al/al-get (load (field before entities)) 0)]
+               (assert (not (load (field initial previous-known)))))
+             (analyzer/analyze-source! (mut after) "order.coil" second-source)
+             (world/reconcile! (mut before) (mut after))
+             (scratch/scratch-reset! (mut old-arena))
+             ;; Reuse the old arena as the next live job, destroying its old contents.
+             (store! before (m/new-snapshot a))
+             (analyzer/analyze-source! (mut before)
+                                       "order.coil"
+                                       "(defstruct Order [(id i64) (priority i64) (count i64)])")
+             (let [changed (al/al-get (load (field after entities)) 0)]
+               (assert (load (field changed previous-known)))
+               (assert (str/str-eq (load (field changed previous-source))
+                                   first-source)))
+             (world/reconcile! (mut after) (mut before))
+             (scratch/scratch-reset! (mut new-arena))
+             (let [changed (al/al-get (load (field before entities)) 0)]
+               (assert (str/str-eq (load (field changed previous-source))
+                                   second-source)))
+             ;; copy-entity must also retain comparison text independently.
+             (let [changed (al/al-get (load (field before entities)) 0)
+                   copied (m/copy-entity b changed)]
+               (scratch/scratch-reset! (mut old-arena))
+               (assert (str/str-eq (load (field copied previous-source))
+                                   second-source))))
+           (scratch/scratch-close! (mut old-arena))
+           (scratch/scratch-close! (mut new-arena))))
+
+(deftest addition-and-removal-comparison-sides
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 original "(defstruct Order [(id i64)])"
+                 (mut empty) (m/new-snapshot a)
+                 (mut added) (m/new-snapshot a)
+                 (mut removed) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut added) "order.coil" original)
+             (world/reconcile! (mut empty) (mut added))
+             (let [e (al/al-get (load (field added entities)) 0)]
+               (assert-eq (load (field e state)) 2)
+               (assert (load (field e previous-known)))
+               (assert (str/str-eq (load (field e previous-source)) "")))
+             (world/reconcile! (mut added) (mut removed))
+             (let [e (al/al-get (load (field removed entities)) 0)]
+               (assert-eq (load (field e state)) 3)
+               (assert (load (field e previous-known)))
+               (assert (str/str-eq (load (field e previous-source)) original))))
+           (scratch/scratch-close! (mut arena))))

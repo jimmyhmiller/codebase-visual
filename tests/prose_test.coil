@@ -1,0 +1,12 @@
+(module atlas.tests.prose)
+(import "atlas.view" :as view)
+
+(deftest prose-wrap-prefers-words-and-preserves-utf8-boundaries
+         (assert (= (view/prose-break "Add order priority" 0 12) 9))
+         (assert (= (view/prose-break "Add order priority" 10 14) 14))
+         (assert (= (view/prose-break "Add order priority" 0 9) 9))
+         (assert (= (view/prose-break "Add order priority" 10 18) 18))
+         (assert (= (view/prose-break "éé item" 0 4) 4))
+         (assert (= (view/prose-break "éé item" 0 7) 4))
+         (assert (= (view/prose-break "one\ntwo" 0 3) 3))
+         (assert (= (view/prose-break "" 0 0) 0)))

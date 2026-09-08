@@ -1,0 +1,17 @@
+(module atlas.timeline)
+
+;;; Snapshot states: unchanged, modified, added, removed.
+(defn classify-change [(existed i64) (exists i64) (before i64) (after i64)] (-> i64)
+  (cond (= exists 0) 3
+        (= existed 0) 2
+        (!= before after) 1
+        :else 0))
+
+;;; Keep playback within the available history; live is an explicit extra state.
+(defn clamp-revision [(index i64) (total i64)] (-> i64)
+  (cond (< index 0) 0 (>= index total) (- total 1) :else index))
+
+(defn playback-period [(speed f64)] (-> f64)
+  (/ 3.0 speed))
+
+(export classify-change clamp-revision playback-period)

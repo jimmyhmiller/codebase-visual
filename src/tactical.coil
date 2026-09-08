@@ -1,0 +1,42 @@
+(module atlas.tactical)
+(import "atlas.ray" :as r)
+
+;;; North-up map coordinates; frame.y stores pixels per world unit.
+(defn project [(p r/Vector3) (frame r/Vector3) (center r/Vector2)] (-> r/Vector2)
+  (r/v2 (+ (cast f64 (load (field center x)))
+           (* (- (cast f64 (load (field p x)))
+                 (cast f64 (load (field frame x))))
+              (cast f64 (load (field frame y)))))
+        (+ (cast f64 (load (field center y)))
+           (* (- (cast f64 (load (field p z)))
+                 (cast f64 (load (field frame z))))
+              (cast f64 (load (field frame y)))))))
+
+(defn unproject [(p r/Vector2) (frame r/Vector3) (center r/Vector2)] (-> r/Vector3)
+  (r/v3 (+ (cast f64 (load (field frame x)))
+           (/ (- (cast f64 (load (field p x)))
+                 (cast f64 (load (field center x))))
+              (cast f64 (load (field frame y)))))
+        0.0
+        (+ (cast f64 (load (field frame z)))
+           (/ (- (cast f64 (load (field p y)))
+                 (cast f64 (load (field center y))))
+              (cast f64 (load (field frame y)))))))
+
+;;; Intersect an orthographic viewport corner with the horizontal target plane.
+;;; This is a camera footprint, not terrain visibility or a fog-of-war mask.
+(defn corner [(target r/Vector3)
+              (yaw f64)
+              (pitch f64)
+              (zoom f64)
+              (width f64)
+              (height f64)
+              (index i64)] (-> r/Vector3)
+  (let [x (if (or (= index 0) (= index 3)) -0.5 0.5)
+        y (if (< index 2) -0.5 0.5)
+        travel
+          (r/drag-distance (r/v2 (* x width) (* y height)) zoom height pitch)]
+    (r/pan-target target
+                  yaw
+                  (- 0.0 (cast f64 (load (field travel x))))
+                  (- 0.0 (cast f64 (load (field travel y)))))))

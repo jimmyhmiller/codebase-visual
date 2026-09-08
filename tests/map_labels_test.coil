@@ -1,0 +1,312 @@
+(module atlas.tests.map-labels)
+(import "atlas.map-labels" :as labels)
+(import "atlas.ray" :as r)
+(import "atlas.view" :as view)
+(import "atlas.model" :as m)
+(import "atlas.landform" :as land)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+
+;;; Reference implementation retained for exact differential regression tests.
+(defn nearest-space-linear [(island r/Rectangle)
+                            (width f64)
+                            (height f64)
+                            (viewport r/Rectangle)
+                            (obstacles (al/ArrayList r/Rectangle))] (-> (Option r/Rectangle))
+  (let [left (cast f64 (load (field viewport x)))
+        top (cast f64 (load (field viewport y)))
+        right (+ left (cast f64 (load (field viewport width))))
+        bottom (+ top (cast f64 (load (field viewport height))))
+        cx
+          (+ (cast f64 (load (field island x)))
+             (* 0.5 (cast f64 (load (field island width)))))
+        cy
+          (+ (cast f64 (load (field island y)))
+             (* 0.5 (cast f64 (load (field island height)))))
+        (mut result) (None [r/Rectangle])
+        (mut best) 1.0e30
+        (mut y) top]
+    (loop (if (> (+ (load y) height) bottom) (break 0) 0)
+      (let [(mut x) left]
+        (loop (if (> (+ (load x) width) right) (break 0) 0)
+          (let [dx (- (+ (load x) (* width 0.5)) cx)
+                dy (- (+ (load y) (* height 0.5)) cy)
+                score (+ (* dx dx) (* dy dy))]
+            (if (< score (load best))
+                (let [box (r/rect (load x) (load y) width height)
+                      (mut clear) true
+                      (mut i) 0]
+                  (loop (if (or (not (load clear))
+                                (>= (load i) (al/al-len obstacles)))
+                            (break 0)
+                            0)
+                    (if (labels/overlaps? box (al/al-get obstacles (load i)))
+                        (store! clear false)
+                        0)
+                    (store! i (+ (load i) 1)))
+                  (if (load clear)
+                      (do (store! best score) (store! result (Some box)))
+                      0))
+                0))
+          (store! x (+ (load x) 8.0))))
+      (store! y (+ (load y) 8.0)))
+    (load result)))
+
+(defn same-placement! [(expected (Option r/Rectangle))
+                       (actual (Option r/Rectangle))] (-> i64)
+  (match expected
+    (None [] (match actual (None [] 0) (Some [_] (do (assert false) 0))))
+    (Some [e]
+          (match actual
+            (None [] (do (assert false) 0))
+            (Some [g]
+                  (let [eb e
+                        gb g]
+                    (assert (< (r/fabs (- (cast f64 (load (field eb x)))
+                                          (cast f64 (load (field gb x)))))
+                               0.00001))
+                    (assert (< (r/fabs (- (cast f64 (load (field eb y)))
+                                          (cast f64 (load (field gb y)))))
+                               0.00001))
+                    0))))))
+
+(deftest indexed-label-search-matches-exhaustive-search
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut trial) 0]
+             (loop (if (>= (load trial) 200) (break 0) 0)
+               (let [(mut obstacles) (al/al-new [r/Rectangle] a)
+                     viewport (r/rect 2.25 -3.5 192.0 128.0)
+                     island (r/rect 70.0 40.0 20.0 30.0)
+                     width (+ 8.0 (cast f64 (% (load trial) 49)))
+                     height (+ 8.0 (cast f64 (% (load trial) 21)))
+                     (mut i) 0]
+                 (loop (if (>= (load i) (% (load trial) 23)) (break 0) 0)
+                   (al/al-push! (mut obstacles)
+                                (r/rect (- (cast f64
+                                                 (% (+ (* (load i) 37)
+                                                       (* (load trial) 13))
+                                                    220))
+                                           20.0)
+                                        (- (cast f64
+                                                 (% (+ (* (load i) 53)
+                                                       (* (load trial) 7))
+                                                    160))
+                                           20.0)
+                                        (+ 8.0
+                                           (cast f64 (% (* (load i) 17) 64)))
+                                        (+ 8.0
+                                           (cast f64 (% (* (load i) 11) 48)))))
+                   (store! i (+ (load i) 1)))
+                 (same-placement! (nearest-space-linear island
+                                                        width
+                                                        height
+                                                        viewport
+                                                        (load obstacles))
+                                  (labels/nearest-space island
+                                                        width
+                                                        height
+                                                        viewport
+                                                        (load obstacles))))
+               (store! trial (+ (load trial) 1))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest label-fallback-finds-clear-space-away-from-fixed-anchors
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut obstacles)
+                   (al/al-new [r/Rectangle]
+                              (scratch/scratch-allocator (mut arena)))
+                 viewport (r/rect 0.0 0.0 400.0 300.0)
+                 island (r/rect 100.0 100.0 100.0 100.0)
+                 gap (r/rect 24.0 24.0 40.0 20.0)]
+             (al/al-push! (mut obstacles) (r/rect 0.0 0.0 400.0 24.0))
+             (al/al-push! (mut obstacles) (r/rect 0.0 24.0 24.0 20.0))
+             (al/al-push! (mut obstacles) (r/rect 64.0 24.0 336.0 20.0))
+             (al/al-push! (mut obstacles) (r/rect 0.0 44.0 400.0 256.0))
+             (match (labels/place island 32.0 16.0 viewport (load obstacles))
+               (None [] (assert false))
+               (Some [placed] (assert (labels/contains? gap placed))))
+             (match (labels/place island 48.0 16.0 viewport (load obstacles))
+               (None [] (assert true))
+               (Some [_] (assert false))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest corner-labels-use-empty-envelope-space-without-covering-the-island
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut obstacles)
+                   (al/al-new [r/Rectangle]
+                              (scratch/scratch-allocator (mut arena)))
+                 bounds (r/rect 200.0 100.0 200.0 120.0)
+                 (mut candidate) 16]
+             (labels/reserve-island! (mut obstacles) bounds 50.0)
+             (loop (if (>= (load candidate) 20) (break 0) 0)
+               (let [box (labels/candidate bounds 30.0 20.0 (load candidate))
+                     (mut i) 0]
+                 (assert (labels/overlaps? bounds box))
+                 (loop (if (>= (load i) (al/al-len (load obstacles)))
+                           (break 0)
+                           0)
+                   (assert (not (labels/overlaps? box
+                                                  (al/al-get (load obstacles)
+                                                             (load i)))))
+                   (store! i (+ (load i) 1))))
+               (store! candidate (+ (load candidate) 1))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest curved-island-reservations-cover-the-swept-ellipse-not-empty-corners
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut variant) 0]
+             (loop (if (>= (load variant) 12) (break 0) 0)
+               (let [(mut obstacles) (al/al-new [r/Rectangle] a)
+                     width (+ 50.0 (* (cast f64 (load variant)) 23.0))
+                     ry (+ 10.0 (* (cast f64 (load variant)) 5.0))
+                     core (* (cast f64 (load variant)) 4.0)
+                     bounds (r/rect 100.0 80.0 width (+ (* ry 2.0) core))
+                     (mut sample) 0]
+                 (labels/reserve-island! (mut obstacles) bounds ry)
+                 (assert-eq (al/al-len (load obstacles)) 16)
+                 (loop (if (>= (load sample) 1024) (break 0) 0)
+                   (let [angle
+                           (* (/ (cast f64 (load sample)) 1024.0)
+                              6.283185307179586)
+                         cy (+ (+ 80.0 ry) (if (> (r/sin angle) 0.0) core 0.0))
+                         point
+                           (r/rect (+ (+ 100.0 (* width 0.5))
+                                      (* (* width 0.5) (r/cos angle)))
+                                   (+ cy (* ry (r/sin angle)))
+                                   0.0
+                                   0.0)
+                         (mut covered) false
+                         (mut i) 0]
+                     (loop (if (>= (load i) 16) (break 0) 0)
+                       (if (labels/contains? (al/al-get (load obstacles)
+                                                        (load i))
+                                             point)
+                           (store! covered true)
+                           0)
+                       (store! i (+ (load i) 1)))
+                     (assert (load covered)))
+                   (store! sample (+ (load sample) 1)))
+                 ;; The AABB corner is empty; reserving it caused false collisions.
+                 (let [corner (r/rect 100.0 80.0 2.0 2.0)
+                       (mut i) 0]
+                   (loop (if (>= (load i) 16) (break 0) 0)
+                     (assert (not (labels/overlaps? corner
+                                                    (al/al-get (load obstacles)
+                                                               (load i)))))
+                     (store! i (+ (load i) 1)))))
+               (store! variant (+ (load variant) 1))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest island-label-envelope-follows-camera-projection
+         (let [(mut v) (zeroed view/View)
+               (mut island) (zeroed m/Island)
+               (mut orientation) 0]
+           (store! (field v width) 1600)
+           (store! (field v height) 1000)
+           (store! (field v zoom) 70.0)
+           (store! (field island radius) 10.0)
+           (store! (field island position) (r/v3 20.0 0.0 -13.0))
+           (loop (if (>= (load orientation) 12) (break 0) 0)
+             (let [yaw (* (cast f64 (load orientation)) 0.63)
+                   pitch (+ 0.35 (* 0.075 (cast f64 (load orientation))))
+                   (mut sample) 0]
+               (store! (field v pitch) pitch)
+               (store! (field v camera)
+                       (r/orbit-camera (r/v3 1.0 0.0 2.0) yaw pitch 70.0))
+               (let [bounds (view/island-screen-bounds (mut v) (load island))]
+                 (loop (if (>= (load sample) 128) (break 0) 0)
+                   (let [angle (* (cast f64 (load sample)) 0.19)
+                         radius (* 9.99 (land/main-coast-bound))
+                         point
+                           (r/v3 (+ 20.0 (* radius (r/cos angle)))
+                                 (if (= (% (load sample) 2) 0) -0.49 4.79)
+                                 (+ -13.0 (* radius (r/sin angle))))
+                         screen
+                           (r/GetWorldToScreenEx point
+                                                 (load (field v camera))
+                                                 1100
+                                                 824)]
+                     (assert (labels/contains? bounds
+                                               (r/rect (+ 200.0
+                                                          (cast f64
+                                                                (load (field screen
+                                                                             x))))
+                                                       (+ 76.0
+                                                          (cast f64
+                                                                (load (field screen
+                                                                             y))))
+                                                       0.0
+                                                       0.0))))
+                   (store! sample (+ (load sample) 1)))))
+             (store! orientation (+ (load orientation) 1)))))
+
+(deftest exterior-map-label-candidates-clear-their-own-island
+         (let [island (r/rect 250.0 180.0 190.0 140.0)
+               (mut i) 0]
+           (loop (if (>= (load i) 16) (break 0) 0)
+             (let [box (labels/candidate island 140.0 70.0 (load i))]
+               (assert (not (labels/overlaps? island box)))
+               (assert (< (r/fabs (- (cast f64 (load (field box width))) 140.0))
+                          0.000001)))
+             (store! i (+ (load i) 1)))))
+
+(deftest map-labels-respect-geometry-overlays-and-previous-labels
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut obstacles)
+                   (al/al-new [r/Rectangle]
+                              (scratch/scratch-allocator (mut arena)))
+                 island (r/rect 250.0 180.0 190.0 140.0)
+                 viewport (r/rect 20.0 20.0 700.0 600.0)]
+             (al/al-push! (mut obstacles) island)
+             ;; Block the preferred bottom position to force a different side.
+             (al/al-push! (mut obstacles)
+                          (labels/candidate island 140.0 70.0 0))
+             (match (labels/place island 140.0 70.0 viewport (load obstacles))
+               (None [] (assert false))
+               (Some [placed]
+                     (let [box placed
+                           (mut i) 0]
+                       (assert (labels/contains? viewport box))
+                       (loop (if (>= (load i) (al/al-len (load obstacles)))
+                                 (break 0)
+                                 0)
+                         (assert (not (labels/overlaps? box
+                                                        (al/al-get (load obstacles)
+                                                                   (load i)))))
+                         (store! i (+ (load i) 1)))
+                       (al/al-push! (mut obstacles) box)
+                       (match (labels/place island
+                                            140.0
+                                            70.0
+                                            viewport
+                                            (load obstacles))
+                         (None [] (assert false))
+                         (Some [next]
+                               (assert (not (labels/overlaps? box next)))))))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest crowded-map-labels-are-omitted-instead-of-clamped-over-buildings
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut obstacles)
+                   (al/al-new [r/Rectangle]
+                              (scratch/scratch-allocator (mut arena)))
+                 island (r/rect 20.0 20.0 100.0 100.0)
+                 viewport (r/rect 0.0 0.0 140.0 140.0)]
+             (al/al-push! (mut obstacles) island)
+             (match (labels/place island 140.0 70.0 viewport (load obstacles))
+               (None [] (assert true))
+               (Some [_] (assert false)))
+             (al/al-push! (mut obstacles) (r/rect 0.0 0.0 1000.0 1000.0))
+             (match (labels/place island 20.0 10.0 viewport (load obstacles))
+               (None [] (assert true))
+               (Some [_] (assert false))))
+           (scratch/scratch-close! (mut arena))))

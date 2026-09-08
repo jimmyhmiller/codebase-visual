@@ -1,0 +1,26 @@
+(module atlas.tests.reference-path)
+(import "atlas.view" :as view)
+(import "atlas.ray" :as r)
+
+(deftest reference-ribbon-connects-foundations-and-clears-middle
+         (let [a (r/v3 0.0 2.0 0.0)
+               b (r/v3 8.0 2.0 0.0)
+               start (view/reference-point a b 0.0)
+               finish (view/reference-point a b 1.0)
+               middle (view/reference-point a b 0.5)
+               (mut i) 0]
+           (assert (< (r/distance2 a start) 0.000001))
+           (assert (< (r/distance2 b finish) 0.000001))
+           (assert (> (cast f64 (load (field middle y))) 3.0))
+           (loop (if (> (load i) 100) (break 0) 0)
+             (let [p (view/reference-point a b (/ (cast f64 (load i)) 100.0))]
+               (assert (> (cast f64 (load (field p y))) 2.039))
+               (assert (< (cast f64 (load (field p y))) 3.041))
+               (assert (< (r/fabs (cast f64 (load (field p z)))) 0.501)))
+             (store! i (+ (load i) 1)))))
+
+(deftest coincident-reference-endpoints-remain-finite
+         (let [a (r/v3 10.0 2.0 -4.0)
+               p (view/reference-point a a 0.5)]
+           (assert (< (r/distance2 a p) 0.000001))
+           (assert (< (r/fabs (- (cast f64 (load (field p y))) 2.04)) 0.000001))))

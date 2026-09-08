@@ -1,0 +1,17 @@
+# Keep Order selected while entering live mode, returning to history, and re-entering live.
+c 15
+e 10 2 47 0 0 0
+e 11 1 47 0 0 0
+e 20 1000 79 0 0 0
+e 21 1000 114 0 0 0
+e 22 1000 100 0 0 0
+e 23 1000 101 0 0 0
+e 24 1000 114 0 0 0
+e 40 2 257 0 0 0
+e 41 1 257 0 0 0
+e 70 2 76 0 0 0
+e 71 1 76 0 0 0
+e 160 2 76 0 0 0
+e 161 1 76 0 0 0
+e 200 2 76 0 0 0
+e 201 1 76 0 0 0

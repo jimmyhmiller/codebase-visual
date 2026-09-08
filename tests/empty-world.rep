@@ -1,0 +1,9 @@
+# Empty map: compact viewport, pan, reset camera, then watch working tree.
+c 7
+e 10 21 1100 720 0 0
+e 20 2 87 0 0 0
+e 30 1 87 0 0 0
+e 40 2 82 0 0 0
+e 41 1 82 0 0 0
+e 60 2 76 0 0 0
+e 61 1 76 0 0 0

@@ -1,0 +1,138 @@
+(module atlas.contours)
+(import "atlas.ray" :as r)
+(import "atlas.folders" :as folders)
+(import "atlas.landform" :as land)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+;;; Territory isolines follow a 2D union of occupied reservations. Unlike a
+;;; center/radius outline, this represents concavities, holes, and disconnected
+;;; island groups without drawing artificial bridges across empty ocean.
+;;; Marching triangles has no ambiguous saddle case. Each cached pair is an
+;;; independent segment; topology and owned storage survive live publication.
+(defn crossing [(a r/Vector3) (b r/Vector3)] (-> r/Vector3)
+  (let [va (cast f64 (load (field a y)))
+        vb (cast f64 (load (field b y)))
+        t (/ va (- va vb))]
+    (r/v3 (r/mix (cast f64 (load (field a x))) (cast f64 (load (field b x))) t)
+          0.10
+          (r/mix (cast f64 (load (field a z))) (cast f64 (load (field b z))) t))))
+
+(defn triangle! [(out (ptr (al/ArrayList r/Vector3)))
+                 (a r/Vector3)
+                 (b r/Vector3)
+                 (c r/Vector3)] (-> i64)
+  (let [aa (>= (load (field a y)) (cast f32 0.0))
+        bb (>= (load (field b y)) (cast f32 0.0))
+        cc (>= (load (field c y)) (cast f32 0.0))]
+    (if (!= aa bb) (al/al-push! out (crossing a b)) 0)
+    (if (!= bb cc) (al/al-push! out (crossing b c)) 0)
+    (if (!= cc aa) (al/al-push! out (crossing c a)) 0)
+    0))
+
+(defn bake-node! [(tree (ptr folders/Tree)) (at i64)] (-> i64)
+  (let [nodes (load (field tree nodes))
+        parent (al/al-get nodes at)
+        padding
+          (r/clamp (+ 4.0 (* 0.035 (load (field parent radius)))) 4.0 48.0)
+        (mut leaves) (al/al-new [folders/Node] (alloc/malloc-allocator))
+        (mut minx) 1.0e30
+        (mut minz) 1.0e30
+        (mut maxx) -1.0e30
+        (mut maxz) -1.0e30
+        (mut i) (+ at 1)]
+    (loop (if (>= (load i) (al/al-len nodes)) (break 0) 0)
+      (let [n (al/al-get nodes (load i))]
+        (if (and (not (load (field n directory)))
+                 (> (load (field n radius)) 0.0)
+                 (folders/descendant? tree (load i) at))
+            (let [p (load (field n position))
+                  radius (+ (load (field n radius)) (* 1.5 padding))
+                  x (cast f64 (load (field p x)))
+                  z (cast f64 (load (field p z)))]
+              (al/al-push! (mut leaves) n)
+              (if (< (- x radius) (load minx)) (store! minx (- x radius)) 0)
+              (if (> (+ x radius) (load maxx)) (store! maxx (+ x radius)) 0)
+              (if (< (- z radius) (load minz)) (store! minz (- z radius)) 0)
+              (if (> (+ z radius) (load maxz)) (store! maxz (+ z radius)) 0))
+            0))
+      (store! i (+ (load i) 1)))
+    (if (> (al/al-len (load leaves)) 0)
+        (let [spanx (- (load maxx) (load minx))
+              spanz (- (load maxz) (load minz))
+              step
+                (r/clamp (/ (if (> spanx spanz) spanx spanz) 192.0)
+                         1.0
+                         1000000.0)
+              nx (+ 2 (cast i64 (r/ceil (/ spanx step))))
+              nz (+ 2 (cast i64 (r/ceil (/ spanz step))))
+              (mut grid) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+              (mut z) 0
+              first (al/al-len (load (field tree borders)))]
+          (loop (if (> (load z) nz) (break 0) 0)
+            (let [(mut x) 0]
+              (loop (if (> (load x) nx) (break 0) 0)
+                (let [wx (+ (- (load minx) step) (* step (cast f64 (load x))))
+                      wz (+ (- (load minz) step) (* step (cast f64 (load z))))
+                      (mut value) -1.0e30
+                      (mut k) 0]
+                  (loop (if (>= (load k) (al/al-len (load leaves))) (break 0) 0)
+                    (let [n (al/al-get (load leaves) (load k))
+                          p (load (field n position))
+                          dx (- wx (cast f64 (load (field p x))))
+                          dz (- wz (cast f64 (load (field p z))))
+                          d
+                            (- (+ (load (field n radius)) padding)
+                               (r/sqrt (+ (* dx dx) (* dz dz))))
+                          h
+                            (r/clamp (- 1.0
+                                        (/ (r/fabs (- d (load value))) padding))
+                                     0.0
+                                     1.0)]
+                      (store! value
+                              (+ (if (> d (load value)) d (load value))
+                                 (* (* 0.25 padding) (* h h)))))
+                    (store! k (+ (load k) 1)))
+                  (al/al-push! (mut grid) (r/v3 wx (load value) wz)))
+                (store! x (+ (load x) 1))))
+            (store! z (+ (load z) 1)))
+          (store! z 0)
+          (loop (if (>= (load z) nz) (break 0) 0)
+            (let [(mut x) 0]
+              (loop (if (>= (load x) nx) (break 0) 0)
+                (let [i (+ (* (load z) (+ nx 1)) (load x))
+                      a (al/al-get (load grid) i)
+                      b (al/al-get (load grid) (+ i 1))
+                      c (al/al-get (load grid) (+ i (+ nx 1)))
+                      d (al/al-get (load grid) (+ i (+ nx 2)))]
+                  (triangle! (field tree borders) a c b)
+                  (triangle! (field tree borders) b c d))
+                (store! x (+ (load x) 1))))
+            (store! z (+ (load z) 1)))
+          (let [node (al/al-elem [folders/Node] (field tree nodes) at)
+                count (- (al/al-len (load (field tree borders))) first)]
+            (store! (field node border-first) first)
+            (store! (field node border-count) count)
+            (if (> count 0)
+                (store! (field node border-label)
+                        (al/al-get (load (field tree borders)) first))
+                0))
+          (al/al-free! (mut grid)))
+        0)
+    (al/al-free! (mut leaves))
+    0))
+
+(defn bake! [(tree (ptr folders/Tree))] (-> i64)
+  (al/al-clear! (field tree borders))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field tree nodes)))) (break 0) 0)
+      (let [node (al/al-elem [folders/Node] (field tree nodes) (load i))]
+        (store! (field node border-first) 0)
+        (store! (field node border-count) 0)
+        (if (and (> (load i) 0)
+                 (load (field node directory))
+                 (> (load (field node radius)) 0.0))
+            (bake-node! tree (load i))
+            0))
+      (store! i (+ (load i) 1)))
+    0))

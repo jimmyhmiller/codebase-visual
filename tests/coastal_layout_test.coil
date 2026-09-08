@@ -1,0 +1,82 @@
+(module atlas.tests.coastal-layout)
+(import "atlas.landform" :as land)
+(import "atlas.ray" :as r)
+
+(deftest coast-angular-slope-stays-within-sizing-proof
+         (let [(mut seed) 0]
+           (loop (if (>= (load seed) 24) (break 0) 0)
+             (let [(mut i) 0]
+               (loop (if (>= (load i) 2048) (break 0) 0)
+                 (let [angle
+                         (* (/ (cast f64 (load i)) 2048.0) 6.283185307179586)
+                       value (* (cast f64 (load seed)) 0.731)
+                       slope
+                         (/ (- (land/coast value
+                                           (+ angle 0.00001)
+                                           (land/plateau-scale))
+                               (land/coast value
+                                           (- angle 0.00001)
+                                           (land/plateau-scale)))
+                            0.00002)]
+                   (assert (< (r/fabs slope) 8.6)))
+                 (store! i (+ (load i) 1))))
+             (store! seed (+ (load seed) 1)))))
+
+;;; Exact ray intersection with the straight segment between adjacent rendered
+;;; shoreline vertices, not the continuous curve used by the sizing bound.
+(defn polygon-radius [(seed f64) (radius f64) (angle f64)] (-> f64)
+  (let [gap (/ 6.283185307179586 (cast f64 (land/coast-segments radius)))
+        a (* (r/floor (/ angle gap)) gap)
+        b (+ a gap)
+        ra
+          (* radius
+             (* (land/plateau-scale) (land/coast seed a (land/plateau-scale))))
+        rb
+          (* radius
+             (* (land/plateau-scale) (land/coast seed b (land/plateau-scale))))]
+    (/ (* (* ra rb) (r/sin gap))
+       (+ (* rb (r/sin (- b angle))) (* ra (r/sin (- angle a)))))))
+
+(deftest coastal-sizing-contains-full-disks-in-rendered-shoreline
+         (let [(mut seed-index) 0
+               (mut tighter) false]
+           (loop (if (>= (load seed-index) 24) (break 0) 0)
+             (let [seed (* (cast f64 (load seed-index)) 0.731)
+                   (mut site) 0]
+               (loop (if (>= (load site) 24) (break 0) 0)
+                 (let [distance
+                         (cond (= (load site) 0) 0.0
+                               (= (load site) 1) 1.05
+                               (= (load site) 2) 1.050001
+                               :else
+                                 (* (cast f64 (load site))
+                                    (cast f64 (load site))))
+                       angle (+ seed (* (cast f64 (load site)) 2.39996323))
+                       x (* distance (r/cos angle))
+                       z (* distance (r/sin angle))
+                       radius (land/required-site-radius seed x z)
+                       (mut sample) 0]
+                   (if (< radius (* (land/required-radius distance) 0.95))
+                       (store! tighter true)
+                       0)
+                   (assert (<= radius (* (land/required-radius distance) 1.002)))
+                   (loop (if (>= (load sample) 256) (break 0) 0)
+                     (let [phase
+                             (* (/ (+ (cast f64 (load sample)) 0.37) 256.0)
+                                6.283185307179586)
+                           px (+ x (* 1.05 (r/cos phase)))
+                           pz (+ z (* 1.05 (r/sin phase)))
+                           polar (r/atan2 pz px)
+                           distance-to-point (r/sqrt (+ (* px px) (* pz pz)))]
+                       (assert (<= distance-to-point
+                                   (+ (polygon-radius seed radius polar)
+                                      0.000001)))
+                       ;; Radius only grows in live/history registration. Changing
+                       ;; tessellation during that growth must preserve containment.
+                       (assert (<= distance-to-point
+                                   (+ (polygon-radius seed (* radius 1.4) polar)
+                                      0.000001))))
+                     (store! sample (+ (load sample) 1))))
+                 (store! site (+ (load site) 1))))
+             (store! seed-index (+ (load seed-index) 1)))
+           (assert (load tighter))))

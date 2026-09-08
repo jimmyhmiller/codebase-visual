@@ -1,0 +1,72 @@
+(module atlas.tests.picking)
+(import "atlas.ray" :as r)
+(import "atlas.glyphs" :as glyph)
+
+(deftest tall-fans-and-tree-crowns-are-pickable
+         (let [cache (glyph/pick-bounds-cache)
+               p (r/v3 10.0 2.0 20.0)
+               (mut i) 0]
+           (loop (if (>= (load i) 18) (break 0) 0)
+             (let [index (if (= (load i) 0) 1 (+ 6 (load i)))
+                   bounds (glyph/translated-bounds (load (index cache index)) p)
+                   roof (cast f64 (load (field (field bounds max) y)))
+                   ray
+                     (r/Ray :position (r/v3 10.0 (- roof 0.02) 30.0)
+                       :direction (r/v3 0.0 0.0 -1.0))
+                   above
+                     (r/Ray :position (r/v3 10.0 (+ roof 0.10) 30.0)
+                       :direction (r/v3 0.0 0.0 -1.0))
+                   hit (r/GetRayCollisionBox ray bounds)
+                   miss (r/GetRayCollisionBox above bounds)
+                   old (r/GetRayCollisionSphere ray p 1.0)]
+               (assert (!= (load (field hit hit)) (cast u8 0)))
+               (assert (= (load (field miss hit)) (cast u8 0)))
+               (assert (= (load (field old hit)) (cast u8 0))))
+             (store! i (+ (load i) 1)))))
+
+(deftest family-picking-bounds-translate-without-changing-height
+         (let [cache (glyph/pick-bounds-cache)
+               p (r/v3 13.0 2.0 -9.0)
+               (mut i) 0]
+           (loop (if (>= (load i) 24) (break 0) 0)
+             (let [local (load (index cache (load i)))
+                   moved (glyph/translated-bounds local p)
+                   a (load (field local min))
+                   b (load (field moved min))
+                   c (load (field local max))
+                   d (load (field moved max))]
+               (assert (< (r/fabs (- (- (cast f64 (load (field b x)))
+                                        (cast f64 (load (field a x))))
+                                     13.0))
+                          0.00001))
+               (assert (< (r/fabs (+ (- (cast f64 (load (field d z)))
+                                        (cast f64 (load (field c z))))
+                                     9.0))
+                          0.00001))
+               (assert (< (r/fabs (- (cast f64 (load (field d y)))
+                                     (cast f64 (load (field c y)))))
+                          0.00001)))
+             (store! i (+ (load i) 1)))))
+
+(deftest tall-struct-roof-is-pickable
+         (let [p (r/v3 10.0 2.0 20.0)
+               bounds (glyph/struct-bounds p 11)
+               roof (- (cast f64 (load (field (field bounds max) y))) 0.02)
+               ray
+                 (r/Ray :position (r/v3 10.0 roof 25.0)
+                   :direction (r/v3 0.0 0.0 -1.0))
+               hit (r/GetRayCollisionBox ray bounds)
+               old (r/GetRayCollisionSphere ray p 1.0)]
+           (assert (!= (load (field hit hit)) (cast u8 0)))
+           (assert (= (load (field old hit)) (cast u8 0)))
+           (assert (> (cast f64 (load (field hit distance))) 0.0))))
+
+(deftest struct-picking-does-not-extend-above-roof
+         (let [p (r/v3 10.0 2.0 20.0)
+               bounds (glyph/struct-bounds p 5)
+               top (+ (cast f64 (load (field (field bounds max) y))) 0.1)
+               ray
+                 (r/Ray :position (r/v3 10.0 top 25.0)
+                   :direction (r/v3 0.0 0.0 -1.0))
+               hit (r/GetRayCollisionBox ray bounds)]
+           (assert (= (load (field hit hit)) (cast u8 0)))))

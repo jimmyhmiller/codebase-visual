@@ -1,0 +1,104 @@
+(module atlas.tests.member-diff)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.world" :as world)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+(import "coil.str" :as str)
+
+(defn compare [(a (dyn alloc/Allocator)) (before (slice u8)) (after (slice u8))] (-> m/Entity)
+  (let [(mut old) (m/new-snapshot a)
+        (mut next) (m/new-snapshot a)]
+    (analyzer/analyze-source! (mut old) "fields.coil" (m/copy-text a before))
+    (analyzer/analyze-source! (mut next) "fields.coil" (m/copy-text a after))
+    (world/reconcile! (mut old) (mut next))
+    (let [entities (load (field next entities))
+          (mut i) 0]
+      (loop (if (>= (load i) (al/al-len entities)) (break (zeroed m/Entity)) 0)
+        (let [e (al/al-get entities (load i))]
+          (if (str/str-eq (load (field e name)) "Item") (break e) 0))
+        (store! i (+ (load i) 1))))))
+
+(deftest member-diffs-separate-current-fields-from-removed-ghosts
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [e
+                   (compare (scratch/scratch-allocator (mut arena))
+                            "(defstruct Item [(id i64) (value i64) (gone bool)])"
+                            "(defstruct Item [(id i64) (value f64) (fresh bool)])")]
+             (assert-eq (al/al-len (load (field e details))) 3)
+             (assert-eq (m/member-count e) 4)
+             (assert-eq (m/member-state e 0) 0)
+             (assert-eq (m/member-state e 1) 1)
+             (assert-eq (m/member-state e 2) 2)
+             (assert-eq (m/member-state e 3) 3)
+             (let [ghost (m/member-detail e 3)]
+               (assert-eq (load (field ghost name)) "gone")
+               (assert-eq (load (field ghost signature)) "bool")))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest member-diffs-ignore-formatting-but-preserve-quoted-token-changes
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 e
+                   (compare a
+                            "(defstruct Item [(x (ptr i64)) (y i64)])"
+                            "(defstruct Item [(y i64) (x (ptr ; comment\n i64))])")
+                 quoted
+                   (compare a
+                            "(defstruct Item [(x (array i64 4))])"
+                            "(defstruct Item [(x (array i64 \"4\"))])")]
+             (assert-eq (m/member-state e 0) 0)
+             (assert-eq (m/member-state e 1) 0)
+             (assert-eq (m/member-state quoted 0) 1))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest partial-and-duplicate-fields-do-not-invent-comparisons
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 partial
+                   (compare a
+                            "(defstruct Item [(x i64) (y bool)])"
+                            "(defstruct Item [(x f64) (y")
+                 duplicate
+                   (compare a
+                            "(defstruct Item [(x i64)])"
+                            "(defstruct Item [(x i64) (x f64)])")]
+             (assert-eq (m/member-count partial) 1)
+             (assert-eq (m/member-state partial 0) 4)
+             (assert-eq (m/member-state duplicate 0) 4)
+             (assert-eq (m/member-state duplicate 1) 4))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest whole-declaration-addition-and-removal-mark-all-observed-fields
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 added (compare a "" "(defstruct Item [(x i64)])")
+                 removed (compare a "(defstruct Item [(x i64)])" "")]
+             (assert-eq (m/member-state added 0) 2)
+             (assert-eq (m/member-state removed 0) 3))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest copied-field-comparison-outlives-both-source-snapshots
+         (let [(mut source) (zeroed scratch/ScratchArena)
+               (mut retained) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut source) (alloc/malloc-allocator))
+           (scratch/scratch-init (mut retained) (alloc/malloc-allocator))
+           (let [e
+                   (compare (scratch/scratch-allocator (mut source))
+                            "(defstruct Item [(gone (ptr i64)) (x i64)])"
+                            "(defstruct Item [(x f64)])")
+                 copy
+                   (m/copy-entity (scratch/scratch-allocator (mut retained)) e)]
+             (scratch/scratch-close! (mut source))
+             (assert-eq (m/member-count copy) 2)
+             (assert-eq (m/member-state copy 0) 1)
+             (assert-eq (m/member-state copy 1) 3)
+             (let [ghost (m/member-detail copy 1)]
+               (assert-eq (load (field ghost name)) "gone")
+               (assert-eq (load (field ghost signature)) "(ptr i64)")))
+           (scratch/scratch-close! (mut retained))))

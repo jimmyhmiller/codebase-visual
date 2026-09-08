@@ -1,0 +1,20 @@
+(module atlas.tests.route-scale)
+(import "atlas.view" :as view)
+(import "atlas.ray" :as r)
+
+(deftest route-width-and-markers-preserve-screen-size-across-zoom-and-resize
+         (let [(mut zoom) 5.0]
+           (loop (if (> (load zoom) 250.0) (break 0) 0)
+             (let [(mut height) 544.0]
+               (loop (if (> (load height) 1600.0) (break 0) 0)
+                 (let [width (view/route-size (load zoom) (load height) 0.55)
+                       radius (view/route-size (load zoom) (load height) 1.7)]
+                   (assert (< (r/fabs (- (/ (* width (load height)) (load zoom))
+                                         0.55))
+                              0.000001))
+                   (assert (< (r/fabs (- (/ (* radius (load height))
+                                            (load zoom))
+                                         1.7))
+                              0.000001)))
+                 (store! height (+ (load height) 280.0))))
+             (store! zoom (* (load zoom) 1.5)))))

@@ -1,0 +1,35 @@
+(module atlas.tests.animation)
+(import "atlas.animation" :as animation)
+(import "atlas.ray" :as r)
+
+(deftest animation-clock-respects-pause-and-speed
+         (assert (< (r/fabs (animation/clock-step 0.1 16.0 true)) 0.000001))
+         (assert (< (r/fabs (- (animation/clock-step 0.1 0.125 false) 0.0125))
+                    0.000001))
+         (assert (< (r/fabs (- (animation/clock-step 0.1 16.0 false) 1.6))
+                    0.000001)))
+
+(deftest construction-and-demolition-envelopes
+         (assert (< (r/fabs (animation/progress -1.0)) 0.000001))
+         (assert (< (r/fabs (- (animation/progress 1.0) 0.5)) 0.000001))
+         (assert (< (r/fabs (- (animation/progress 3.0) 1.0)) 0.000001))
+         (assert (< (animation/clip-height 2 0.0) 1.99))
+         (assert (> (animation/clip-height 2 2.0) 4.7))
+         (assert (> (animation/clip-height 3 0.0) 4.7))
+         (assert (< (animation/clip-height 3 2.0) 1.99))
+         (assert (> (animation/clip-height 0 1.0) 100.0))
+         (assert (> (animation/clip-height 1 1.0) 100.0))
+         (assert (animation/blueprint? 2 1.0))
+         (assert (not (animation/blueprint? 2 2.0)))
+         (assert (animation/blueprint? 3 100.0)))
+
+(deftest transition-envelopes-are-monotonic
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 200) (break 0) 0)
+             (let [a (* (cast f64 (load i)) 0.01)
+                   b (+ a 0.01)]
+               (assert (<= (animation/clip-height 2 a)
+                           (animation/clip-height 2 b)))
+               (assert (>= (animation/clip-height 3 a)
+                           (animation/clip-height 3 b))))
+             (store! i (+ (load i) 1)))))

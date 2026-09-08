@@ -1,0 +1,11 @@
+# Focus Priority from the change list, deselect, then click its upper leaves.
+c 9
+e 10 7 1390 713 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 90 7 1100 200 0 0
+e 91 6 0 0 0 0
+e 92 5 0 0 0 0
+e 110 7 735 410 0 0
+e 111 6 0 0 0 0
+e 112 5 0 0 0 0

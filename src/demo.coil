@@ -1,0 +1,256 @@
+(module atlas.demo)
+(import "atlas.repository" :as git)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+
+;;; The bundled replay is a real local Git repository containing a small Coil
+;;; fulfillment domain. It is created once; later launches preserve live edits.
+(defn domain-types [(name (slice u8))] (-> (slice u8))
+  (cond (str/str-eq name "order")
+          "(defstruct LineItem [(sku i64) (quantity i64) (unit-price i64)])
+(defstruct Cart [(entries (slice LineItem)) (customer Customer)])
+(defstruct Discount [(basis-points i64) (minimum i64)])
+(defstruct Coupon [(code (slice u8)) (discount Discount) (expires i64)])
+(defstruct Invoice [(id i64) (lines (slice LineItem)) (total i64)])
+(defsum OrderEvent (Submitted) (Paid) (Packed) (Shipped) (Delivered))
+(defstruct EventQueue [(head i64) (tail i64) (events (slice OrderEvent))])
+(defstruct OrderHistory [(entries (slice OrderEvent))])
+(defstruct OrderTree [(children (slice i64)) (root i64)])
+(defstruct Allocation [(warehouse i64) (items (slice LineItem))])
+(defstruct Fulfillment [(invoice Invoice) (allocation Allocation) (status Status)])
+(defstruct OrderPolicy [(max-items i64) (allow-backorder bool) (minimum-total i64)])
+(defn line-total [(item LineItem)] (-> i64) (* (load (field item quantity)) (load (field item unit-price))))
+(defn eligible? [(amount i64) (discount Discount)] (-> bool) (>= amount (load (field discount minimum))))\n"
+        (str/str-eq name "inventory")
+          "(defstruct StockItem [(sku i64) (available i64) (reserved i64)])
+(defstruct Bin [(id i64) (capacity i64) (items (slice StockItem))])
+(defstruct Rack [(children (slice Bin)) (zone i64)])
+(defstruct Warehouse [(id i64) (address Address) (racks (slice Rack))])
+(defstruct StockIndex [(entries (slice StockItem))])
+(defsum Movement (Receive) (Reserve) (Release) (Pick) (Transfer))
+(defstruct MovementRecord [(sku i64) (quantity i64) (movement Movement)])
+(defstruct ReplenishmentQueue [(head i64) (tail i64) (items (slice StockItem))])
+(defstruct Transfer [(from i64) (destination i64) (items (slice StockItem))])
+(defstruct StockAudit [(timestamp i64) (expected i64) (actual i64)])
+(defstruct Supplier [(id i64) (lead-time i64) (address Address)])
+(defstruct PurchaseOrder [(supplier Supplier) (items (slice StockItem)) (status Status)])
+(defn free-stock [(item StockItem)] (-> i64) (- (load (field item available)) (load (field item reserved))))\n"
+        (str/str-eq name "payment")
+          "(defstruct Money [(minor-units i64) (currency i64)])
+(defstruct Account [(id i64) (balance Money) (customer Customer)])
+(defsum PaymentMethod (Card) (BankTransfer) (Credit))
+(defstruct Authorization [(id i64) (amount Money) (method PaymentMethod)])
+(defstruct Capture [(authorization i64) (amount Money) (timestamp i64)])
+(defstruct Refund [(capture i64) (amount Money) (reason (slice u8))])
+(defstruct Ledger [(entries (slice Capture)) (balance Money)])
+(defstruct PaymentQueue [(head i64) (tail i64) (items (slice Authorization))])
+(defstruct Settlement [(id i64) (captures (slice Capture)) (status Status)])
+(defstruct PaymentRoute [(nodes (slice Account)) (edges (slice i64))])
+(defstruct ExchangeRate [(source i64) (destination i64) (basis-points i64)])
+(defn convert [(amount i64) (rate ExchangeRate)] (-> i64) (/ (* amount (load (field rate basis-points))) 10000))\n"
+        (str/str-eq name "shipping")
+          "(defstruct Dimensions [(width i64) (height i64) (depth i64)])
+(defstruct Parcel [(id i64) (weight i64) (size Dimensions)])
+(defstruct Shipment [(id i64) (parcels (slice Parcel)) (destination Address)])
+(defsum Carrier (Postal) (Express) (Freight))
+(defstruct Service [(carrier Carrier) (max-weight i64) (days i64)])
+(defstruct Route [(nodes (slice Address)) (edges (slice i64))])
+(defstruct TrackingEvent [(timestamp i64) (location Address) (status Status)])
+(defstruct TrackingIndex [(entries (slice TrackingEvent))])
+(defstruct LoadingQueue [(head i64) (tail i64) (parcels (slice Parcel))])
+(defstruct Manifest [(carrier Carrier) (shipments (slice Shipment))])
+(defstruct DeliveryWindow [(start i64) (end i64)])
+(defn volume [(size Dimensions)] (-> i64) (* (load (field size width)) (* (load (field size height)) (load (field size depth)))))\n"
+        (str/str-eq name "infra")
+          "(defstruct Connection [(id i64) (opened-at i64) (healthy bool)])
+(defstruct ConnectionPool [(entries (slice Connection)) (maximum i64)])
+(defstruct CacheEntry [(key (slice u8)) (value (slice u8)) (expires i64)])
+(defstruct Cache [(entries (slice CacheEntry)) (capacity i64)])
+(defstruct RetryPolicy [(attempts i64) (delay i64) (ceiling i64)])
+(defstruct Job [(id i64) (attempt i64) (payload (slice u8))])
+(defstruct JobQueue [(head i64) (tail i64) (jobs (slice Job))])
+(defsum Health (Healthy) (Degraded) (Unavailable))
+(defstruct ServiceNode [(id i64) (health Health)])
+(defstruct Topology [(nodes (slice ServiceNode)) (edges (slice i64))])
+(defstruct TraceTree [(children (slice i64)) (duration i64)])
+(defstruct Metric [(name (slice u8)) (value i64) (timestamp i64)])
+(defn expired? [(entry CacheEntry) (now i64)] (-> bool) (>= now (load (field entry expires))))\n"
+        (str/str-eq name "api")
+          "(defsum Method (Get) (Post) (Put) (Delete))
+(defstruct Header [(name (slice u8)) (value (slice u8))])
+(defstruct HeaderMap [(entries (slice Header))])
+(defstruct Endpoint [(path (slice u8)) (method Method) (timeout i64)])
+(defstruct RouteTree [(children (slice Endpoint))])
+(defstruct Session [(id i64) (customer Customer) (expires i64)])
+(defstruct Credential [(subject i64) (scopes (slice i64))])
+(defstruct RateLimit [(capacity i64) (remaining i64) (resets i64)])
+(defstruct ApiError [(code i64) (message (slice u8))])
+(defstruct RequestQueue [(head i64) (tail i64) (requests (slice Record))])
+(defn allowed? [(limit RateLimit)] (-> bool) (> (load (field limit remaining)) 0))\n"
+        :else
+          "(defstruct Identifier [(value i64)])
+(defstruct Timestamp [(seconds i64) (nanoseconds i64)])
+(defstruct Interval [(start Timestamp) (end Timestamp)])
+(defsum Severity (Debug) (Info) (Warning) (Error))
+(defstruct LogEntry [(time Timestamp) (severity Severity) (message (slice u8))])
+(defstruct LogQueue [(head i64) (tail i64) (entries (slice LogEntry))])
+(defstruct Attribute [(key (slice u8)) (value (slice u8))])
+(defstruct Attributes [(entries (slice Attribute))])
+(defstruct ConfigTree [(children (slice Attribute))])\n"))
+
+(defn source [(a (dyn alloc/Allocator)) (name (slice u8)) (revision i64)] (-> (slice u8))
+  (let [header (git/concat a (git/concat a "(module demo." name) ")\n")
+        types
+          "(defstruct Address [(street (slice u8)) (city (slice u8)) (postal (slice u8))])
+(defstruct Customer [(id i64) (name (slice u8)) (address Address)])
+(defsum Status (Pending) (Active) (Complete) (Cancelled))
+(defstruct Record [(id i64) (owner i64) (amount i64) (status Status)])
+(defstruct Journal [(entries (slice Record)) (version i64)])
+(defstruct Hierarchy [(value i64) (children (slice i64))])
+(defstruct WorkQueue [(head i64) (tail i64) (items (slice Record))])
+(deftrait Identified [Self] (identity [(self Self)] (-> i64)))
+(impl Identified Record (identity [(self Record)] (-> i64) (load (field self id))))
+(defn valid-amount? [(amount i64)] (-> bool) (>= amount 0))
+(defn subtotal [(price i64) (quantity i64)] (-> i64) (* price quantity))
+(defn with-tax [(amount i64) (basis-points i64)] (-> i64) (+ amount (/ (* amount basis-points) 10000)))
+(defn remaining [(total i64) (processed i64)] (-> i64) (- total processed))
+"
+        base (git/concat a (git/concat a header types) (domain-types name))
+        imports
+          (cond (str/str-eq name "order")
+                  "(import \"demo.payment\" :as payment)\n(import \"demo.inventory\" :as inventory)\n(import \"demo.shipping\" :as shipping)\n"
+                (str/str-eq name "payment")
+                  "(import \"demo.shared\" :as shared)\n"
+                (str/str-eq name "inventory")
+                  "(import \"demo.infra\" :as infra)\n"
+                (str/str-eq name "api") "(import \"demo.order\" :as order)\n"
+                (str/str-eq name "shipping")
+                  "(import \"demo.shared\" :as shared)\n"
+                :else "")
+        content (git/concat a base imports)]
+    (cond (and (>= revision 1) (str/str-eq name "order"))
+            (git/concat a
+                        content
+                        (if (>= revision 3)
+                            "(defsum Priority (Normal) (Expedited) (Critical))\n(defstruct Order [(id i64) (priority Priority) (customer Customer) (deadline i64)])\n(defn priority-weight [(p Priority)] (-> i64) (match p (Normal [] 1) (Expedited [] 5) (Critical [] 10)))\n"
+                            "(defsum Priority (Normal) (Expedited))\n(defstruct Order [(id i64) (priority Priority) (customer Customer)])\n"))
+          (and (>= revision 2) (str/str-eq name "shipping"))
+            (git/concat a
+                        content
+                        "(defstruct DispatchQueue [(head i64) (tail i64) (orders (slice Record))])\n(defn estimate-days [(distance i64)] (-> i64) (+ 1 (/ distance 500)))\n")
+          (and (>= revision 4) (str/str-eq name "inventory"))
+            (git/concat a
+                        content
+                        "(defstruct Reservation [(id i64) (quantity i64) (expires i64)])\n(defstruct WarehouseTree [(children (slice Reservation)) (capacity i64)])\n")
+          (and (>= revision 5) (str/str-eq name "api"))
+            (git/concat a
+                        content
+                        "(defstruct Request [(id i64) (method i64) (payload (slice u8))])\n(defstruct Response [(status i64) (body (slice u8))])\n")
+          :else content)))
+
+(defn name-at [(i i64)] (-> (slice u8))
+  (cond (= i 0) "order"
+        (= i 1) "payment"
+        (= i 2) "inventory"
+        (= i 3) "shipping"
+        (= i 4) "shared"
+        (= i 5) "infra"
+        :else "api"))
+
+(defn title-at [(i i64)] (-> (ptr i8))
+  (cond (= i 0) c"Establish fulfillment domain"
+        (= i 1) c"Introduce order prioritization"
+        (= i 2) c"Propagate priority into shipping"
+        (= i 3) c"Add critical priority and order deadlines"
+        (= i 4) c"Reserve inventory with expiry"
+        :else c"Expose fulfillment request and response"))
+
+(defn path [] (-> (ptr i8))
+  c"build/demo-v2")
+
+(defn ensure-demo! [(a (dyn alloc/Allocator))] (-> i64)
+  (ensure-at! a (str/cstr->str (path))))
+
+(defn ensure-at! [(a (dyn alloc/Allocator)) (root (slice u8))] (-> i64)
+  (let [prefix (git/concat a root "/")]
+    (if (!= (r/DirectoryExists (str/str->cstr a (git/concat a prefix ".git")))
+            (cast u8 0))
+        0
+        (let [(mut repo) (cast (ptr git/git_repository) 0)]
+          (r/MakeDirectory (str/str->cstr a root))
+          (if (!= (git/git_repository_init (mut repo)
+                                           (str/str->cstr a root)
+                                           (cast u32 0))
+                  (cast i32 0))
+              1
+              (let [(mut index) (cast (ptr git/git_index) 0)
+                    (mut sig) (cast (ptr git/git_signature) 0)
+                    (mut parent) (cast (ptr git/git_commit) 0)
+                    (mut revision) 0
+                    (mut status) 0]
+                (git/git_repository_index (mut index) (load repo))
+                (git/git_signature_now (mut sig)
+                                       c"Atlas Demo"
+                                       c"demo@atlas.local")
+                (loop (if (or (>= (load revision) 6) (!= (load status) 0))
+                          (break 0)
+                          0)
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) 7) (break 0) 0)
+                      (let [name (name-at (load i))
+                            dir (git/concat a prefix name)
+                            path (git/concat a name "/domain.coil")
+                            full (git/concat a prefix path)]
+                        (r/MakeDirectory (str/str->cstr a dir))
+                        (r/SaveFileText (str/str->cstr a full)
+                                        (str/str->cstr a
+                                                       (source a
+                                                               name
+                                                               (load revision))))
+                        (git/git_index_add_bypath (load index)
+                                                  (str/str->cstr a path)))
+                      (store! i (+ (load i) 1))))
+                  (let [(mut oid) (zeroed git/git_oid)
+                        (mut tree) (cast (ptr git/git_tree) 0)
+                        (mut result) (zeroed git/git_oid)]
+                    (git/git_index_write (load index))
+                    (git/git_index_write_tree (mut oid) (load index))
+                    (git/git_tree_lookup (mut tree) (load repo) (mut oid))
+                    (store! status
+                            (cast i64
+                                  (if (= (load revision) 0)
+                                      (git/git_commit_create_v (mut result)
+                                                               (load repo)
+                                                               c"HEAD"
+                                                               (load sig)
+                                                               (load sig)
+                                                               (cast (ptr i8) 0)
+                                                               (title-at (load revision))
+                                                               (load tree)
+                                                               0)
+                                      (git/git_commit_create_v (mut result)
+                                                               (load repo)
+                                                               c"HEAD"
+                                                               (load sig)
+                                                               (load sig)
+                                                               (cast (ptr i8) 0)
+                                                               (title-at (load revision))
+                                                               (load tree)
+                                                               1
+                                                               (load parent)))))
+                    (if (!= (cast i64 (load parent)) 0)
+                        (do (git/git_commit_free (load parent)) 0)
+                        0)
+                    (git/git_commit_lookup (mut parent)
+                                           (load repo)
+                                           (mut result))
+                    (git/git_tree_free (load tree)))
+                  (store! revision (+ (load revision) 1)))
+                (if (!= (cast i64 (load parent)) 0)
+                    (do (git/git_commit_free (load parent)) 0)
+                    0)
+                (git/git_signature_free (load sig))
+                (git/git_index_free (load index))
+                (git/git_repository_free (load repo))
+                (load status)))))))

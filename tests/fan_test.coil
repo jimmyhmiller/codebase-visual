@@ -1,0 +1,36 @@
+(module atlas.tests.fan)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+
+(deftest folded-fan-has-thickness-clearance-and-raised-crown
+         (let [p (r/v3 10.0 1.99 -5.0)
+               (mut leaf) 0]
+           (loop (if (>= (load leaf) 9) (break 0) 0)
+             (let [angle (+ -1.55 (* (cast f64 (load leaf)) 0.35))
+                   a (glyph/fan-point p angle 0)
+                   b (glyph/fan-point p angle 1)
+                   c (glyph/fan-point p angle 2)
+                   d (glyph/fan-point p angle 3)
+                   ab (glyph/vector-add b (glyph/vector-scale a -1.0))
+                   ac (glyph/vector-add c (glyph/vector-scale a -1.0))
+                   ad (glyph/vector-add d (glyph/vector-scale a -1.0))
+                   (mut side) 0]
+               ;; Non-coplanar faces: the crease is geometry, not painted stripes.
+               (assert (> (r/fabs (glyph/vector-dot (glyph/vector-cross ab ac)
+                                                    ad))
+                          0.004))
+               (loop (if (>= (load side) 4) (break 0) 0)
+                 (let [front (glyph/fan-point p angle (load side))
+                       back (glyph/fan-point p angle (+ (load side) 4))]
+                   (assert (< (r/distance2 p front) 1.1025))
+                   (assert (< (r/fabs (- (- (cast f64 (load (field back z)))
+                                            (cast f64 (load (field front z))))
+                                         0.07))
+                              0.00001))
+                   (assert (< (r/fabs (- (cast f64 (load (field front y)))
+                                         (cast f64 (load (field back y)))))
+                              0.00001))
+                   (assert (> (cast f64 (load (field front y))) 2.2499))
+                   (assert (< (cast f64 (load (field front y))) 3.7901)))
+                 (store! side (+ (load side) 1))))
+             (store! leaf (+ (load leaf) 1)))))

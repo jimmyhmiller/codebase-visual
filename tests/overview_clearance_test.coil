@@ -1,0 +1,84 @@
+(module atlas.tests.overview-clearance)
+(import "atlas.overview" :as overview)
+(import "atlas.terrain" :as terrain)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(deftest overview-clearance-is-analytic-and-retains-mesh-margin
+         (let [(mut island) (zeroed m/Island)
+               (mut kinds) (zeroed (array bool 7))
+               (mut i) 0]
+           (store! (field island radius) 11.0)
+           (store! (field island position) (r/v3 13.0 0.0 -7.0))
+           (store! (index kinds 0) true)
+           (let [anchor (overview/anchor (load island) 0)
+                 radius (overview/footprint (load island) 0)]
+             (loop (if (>= (load i) 128) (break 0) 0)
+               (let [angle (* (cast f64 (load i)) (/ 6.283185307179586 128.0))
+                     distance (+ radius 0.49)
+                     p
+                       (r/v3 (+ 13.0 (* distance (r/cos angle)))
+                             0.0
+                             (+ -7.0 (* distance (r/sin angle))))
+                     outside
+                       (r/v3 (+ 13.0 (* (+ radius 1.26) (r/cos angle)))
+                             0.0
+                             (+ -7.0 (* (+ radius 1.26) (r/sin angle))))]
+                 (assert (< (r/fabs (- (overview/clearance p
+                                                           (load island)
+                                                           (load kinds))
+                                       0.49))
+                            0.00001))
+                 (assert (< (terrain/landmark-mask p (load island) (load kinds))
+                            0.00001))
+                 (assert (> (terrain/landmark-mask outside
+                                                   (load island)
+                                                   (load kinds))
+                            0.99999)))
+               (store! i (+ (load i) 1)))
+             (assert (< (overview/clearance anchor (load island) (load kinds))
+                        0.0))
+             (store! (index kinds 0) false)
+             (assert (> (terrain/landmark-mask anchor
+                                               (load island)
+                                               (load kinds))
+                        0.99999)))))
+
+(deftest overview-terrain-keeps-landmark-footprints-free-of-relief-and-rocks
+         (let [a (alloc/malloc-allocator)
+               (mut islands) (al/al-new [m/Island] a)
+               (mut entities) (al/al-new [m/Entity] a)
+               (mut island) (zeroed m/Island)
+               (mut kinds) (zeroed (array bool 7))
+               (mut kind) 0]
+           (store! (field island radius) 11.0)
+           (store! (field island seed) 177)
+           (al/al-push! (mut islands) (load island))
+           (loop (if (>= (load kind) 7) (break 0) 0)
+             (let [(mut e) (zeroed m/Entity)]
+               (store! (field e kind) (load kind))
+               (store! (field e position) (r/v3 0.0 2.0 0.0))
+               (al/al-push! (mut entities) (load e)))
+             (store! (index kinds (load kind)) true)
+             (store! kind (+ (load kind) 1)))
+           (let [(mut vertices)
+                   (terrain/generate-with-landmarks (load islands)
+                                                    (load entities)
+                                                    true)
+                 (mut i) 0
+                 (mut inside) 0]
+             (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+               (let [vertex (al/al-get (load vertices) (load i))
+                     p (load (field vertex p))]
+                 (if (< (overview/clearance p (load island) (load kinds)) 0.0)
+                     (do
+                       (assert (<= (cast f64 (load (field p y))) 1.94001))
+                       (store! inside (+ (load inside) 1)))
+                     0))
+               (store! i (+ (load i) 1)))
+             (assert (> (load inside) 100))
+             (al/al-free! (mut vertices)))
+           (al/al-free! (mut entities))
+           (al/al-free! (mut islands))))

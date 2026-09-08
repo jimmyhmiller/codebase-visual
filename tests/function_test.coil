@@ -1,0 +1,40 @@
+(module atlas.tests.function)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+
+(deftest function-pavilion-mesh-fits-picking-and-clearance
+         (let [(mut vertices) (glyph/generate-function 4)
+               bounds (glyph/pick-bounds-cache)
+               b (load (index bounds 6))
+               (mut i) 0]
+           (assert-eq (al/al-len (load vertices)) 1008)
+           (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+             (let [vertex (al/al-get (load vertices) (load i))
+                   p (load (field vertex p))
+                   n (load (field vertex normal))]
+               (assert (< (r/fabs (- (glyph/vector-dot n n) 1.0)) 0.00001))
+               (assert (< (r/distance2 p (r/v3 0.0 1.99 0.0)) 1.1025))
+               (assert (>= (load (field p x)) (load (field (field b min) x))))
+               (assert (<= (load (field p x)) (load (field (field b max) x))))
+               (assert (>= (load (field p y)) (load (field (field b min) y))))
+               (assert (<= (load (field p y)) (load (field (field b max) y))))
+               (assert (>= (load (field p z)) (load (field (field b min) z))))
+               (assert (<= (load (field p z)) (load (field (field b max) z)))))
+             (store! i (+ (load i) 1)))
+           (al/al-free! (mut vertices))))
+
+(deftest function-pavilion-has-an-open-front-bay
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 12) (break 0) 0)
+             (let [part (glyph/function-part (load i))
+                   p (load (field part center))
+                   size (load (field part size))
+                   ;; A point inside the front entrance must not be in any solid part.
+                   dx (r/fabs (cast f64 (load (field p x))))
+                   dy (r/fabs (- (cast f64 (load (field p y))) 0.27))
+                   dz (r/fabs (- (cast f64 (load (field p z))) 0.30))]
+               (assert (or (> dx (* 0.5 (cast f64 (load (field size x)))))
+                           (or (> dy (* 0.5 (cast f64 (load (field size y)))))
+                               (> dz (* 0.5 (cast f64 (load (field size z)))))))))
+             (store! i (+ (load i) 1)))))

@@ -1,0 +1,89 @@
+(module atlas.search)
+(import "atlas.model" :as m)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use [slice-len slice-get])
+
+(defstruct Search
+  [(query str/String)
+   (active bool)
+   (cursor i64)
+   (results (al/ArrayList i64))])
+
+(defn new-search [(a (dyn alloc/Allocator))] (-> Search)
+  (Search
+    :query (str/string-new a)
+    :active false
+    :cursor 0
+    :results (al/al-new [i64] a)))
+
+(defn query-text [(s (ptr Search))] (-> (slice u8))
+  (str/string-view-bytes (str/string-as-view (load (field s query)))))
+
+(defn fold [(b u8)] (-> u8)
+  (if (and (>= b (cast u8 65)) (<= b (cast u8 90)))
+      (cast u8 (+ (cast i64 b) 32))
+      b))
+
+;;; ASCII case-insensitive matching; other UTF-8 bytes match exactly.
+(defn find-text [(text (slice u8)) (query (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (> (+ (load i) (slice-len query)) (slice-len text)) (break -1) 0)
+      (let [(mut j) 0
+            (mut matches) true]
+        (loop (if (>= (load j) (slice-len query)) (break 0) 0)
+          (if (!= (fold (slice-get text (+ (load i) (load j))))
+                  (fold (slice-get query (load j))))
+              (do (store! matches false) (break 0))
+              0)
+          (store! j (+ (load j) 1)))
+        (if (load matches) (break (load i)) 0))
+      (store! i (+ (load i) 1)))))
+
+(defn rank [(e m/Entity) (query (slice u8))] (-> i64)
+  (let [name (load (field e name))
+        at (find-text name query)]
+    (cond (and (= at 0) (= (slice-len name) (slice-len query))) 0
+          (= at 0) 1
+          (>= at 0) 2
+          (>= (find-text (load (field e path)) query) 0) 3
+          (>= (find-text (load (field e module)) query) 0) 4
+          :else -1)))
+
+(defn refresh! [(s (ptr Search)) (snapshot (ptr m/Snapshot))] (-> i64)
+  (al/al-clear! (field s results))
+  (let [entities (load (field snapshot entities))
+        query (query-text s)
+        (mut priority) 0]
+    (loop (if (> (load priority) 4) (break 0) 0)
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+          (if (= (rank (al/al-get entities (load i)) query) (load priority))
+              (al/al-push! (field s results) (load i))
+              0)
+          (store! i (+ (load i) 1))))
+      (store! priority (+ (load priority) 1))))
+  (let [count (al/al-len (load (field s results)))]
+    (if (>= (load (field s cursor)) count)
+        (store! (field s cursor) (if (> count 0) (- count 1) 0))
+        0))
+  0)
+
+(defn append-codepoint! [(s (ptr Search)) (code i64)] (-> i64)
+  (if (and (>= code 32) (<= code 1114111))
+      (match (str/rune-new (cast u32 code))
+        (Some [rune] (str/string-push-rune! (mut (field s query)) rune))
+        (None [] 0))
+      0)
+  (store! (field s cursor) 0)
+  0)
+
+(defn backspace! [(s (ptr Search))] (-> i64)
+  (str/string-pop-rune! (mut (field s query)))
+  (store! (field s cursor) 0)
+  0)
+
+(defn close! [(s (ptr Search))] (-> i64)
+  (str/string-free! (mut (field s query)))
+  (al/al-free! (field s results)))

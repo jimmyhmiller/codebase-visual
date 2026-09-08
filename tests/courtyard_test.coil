@@ -1,0 +1,74 @@
+(module atlas.tests.courtyard)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.terrain" :as terrain)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+
+(deftest courtyard-shell-has-recess-rim-and-positive-volume
+         (let [(mut vertices) (glyph/generate-courtyard 0)
+               (mut i) 0
+               (mut volume) 0.0
+               (mut upward) 0
+               (mut downward) 0
+               center (r/v3 0.0 1.99 0.0)]
+           (assert-eq (al/al-len (load vertices)) 2016)
+           (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+             (let [v (al/al-get (load vertices) (load i))
+                   p (load (field v p))
+                   normal (load (field v normal))
+                   length (glyph/vector-dot normal normal)]
+               (assert (< (r/fabs (- length 1.0)) 0.00001))
+               (assert (< (r/distance2 p center) (* 1.05 1.05)))
+               (assert (>= (cast f64 (load (field p y))) 2.0199))
+               (assert (<= (cast f64 (load (field p y))) 2.5601))
+               (if (> (cast f64 (load (field normal y))) 0.99)
+                   (store! upward (+ (load upward) 1))
+                   0)
+               (if (< (cast f64 (load (field normal y))) -0.99)
+                   (store! downward (+ (load downward) 1))
+                   0)
+               (if (= (% (load i) 3) 0)
+                   (let [vb (al/al-get (load vertices) (+ (load i) 1))
+                         vc (al/al-get (load vertices) (+ (load i) 2))]
+                     (store! volume
+                             (+ (load volume)
+                                (/ (glyph/vector-dot p
+                                                     (glyph/vector-cross (load (field vb
+                                                                                      p))
+                                                                         (load (field vc
+                                                                                      p))))
+                                   6.0))))
+                   0))
+             (store! i (+ (load i) 1)))
+    (assert (> (load volume) 0.15))
+    (assert (< (load volume) 0.5))
+           (assert (> (load upward) 0))
+           (assert (> (load downward) 0))
+           (let [rim (glyph/courtyard-point 0.57 8 0)
+                 floor (glyph/courtyard-point 0.57 10 0)
+                 outer (glyph/courtyard-point 0.57 6 0)]
+             (assert (> (- (cast f64 (load (field rim y)))
+                           (cast f64 (load (field floor y))))
+                        0.42))
+             (assert (< (cast f64 (load (field outer x)))
+                        (cast f64 (load (field rim x))))))
+           (al/al-free! (mut vertices))))
+
+(deftest courtyard-picking-contains-all-cached-vertices
+         (let [cache (glyph/pick-bounds-cache)
+               bounds (load (index cache 2))
+               lo (load (field bounds min))
+               hi (load (field bounds max))
+               (mut vertices) (glyph/generate-courtyard 4)
+               (mut i) 0]
+           (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+             (let [v (al/al-get (load vertices) (load i))
+                   p (load (field v p))]
+               (assert (>= (load (field p x)) (load (field lo x))))
+               (assert (>= (load (field p y)) (load (field lo y))))
+               (assert (>= (load (field p z)) (load (field lo z))))
+               (assert (<= (load (field p x)) (load (field hi x))))
+               (assert (<= (load (field p y)) (load (field hi y))))
+               (assert (<= (load (field p z)) (load (field hi z)))))
+             (store! i (+ (load i) 1)))
+           (al/al-free! (mut vertices))))

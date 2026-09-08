@@ -1,0 +1,289 @@
+(module atlas.model)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "atlas.ray" :as r)
+
+;;; Identities use path + declaration name, independent of line number.
+;;; States: unchanged, modified, added, removed. Kinds: struct, enum, map,
+;;; tree, queue, graph, function. All borrowed text belongs to the snapshot arena.
+(defstruct MemberDetail
+  [(name (slice u8)) (signature (slice u8)) (line i64) (fingerprint i64)])
+
+(defstruct MemberDelta [(current i64) (previous i64) (state i64)])
+
+(defstruct Entity
+  [(id i64)
+   (name (slice u8))
+   (path (slice u8))
+   (module (slice u8))
+   (kind i64)
+   (line i64)
+   (members i64)
+   (details (al/ArrayList MemberDetail))
+   (details-known bool)
+   (previous-details (al/ArrayList MemberDetail))
+   (previous-details-known bool)
+   (detail-changes (al/ArrayList MemberDelta))
+   (fingerprint i64)
+   (shape i64)
+   (source (slice u8))
+   (previous-source (slice u8))
+   (previous-known bool)
+   (state i64)
+   (island i64)
+   (position r/Vector3)])
+
+(defstruct Dependency
+  [(source (slice u8)) (target (slice u8)) (path (slice u8))])
+
+(defstruct ModuleRoute [(source i64) (target i64)])
+
+(defstruct Reference [(source i64) (target (slice u8)) (module (slice u8))])
+
+(defstruct Source [(path (slice u8)) (text (slice u8))])
+
+;;; Immutable reverse reference graph, owned by the same arena as its snapshot.
+(defstruct ImpactLink [(source i64) (next i64)])
+
+(defstruct ImpactGraph
+  [(heads (al/ArrayList i64))
+   (links (al/ArrayList ImpactLink))
+   (unresolved i64)
+   (ambiguous i64)])
+
+(defstruct Snapshot
+  [(entities (al/ArrayList Entity))
+   (edges (al/ArrayList Dependency))
+   (routes (al/ArrayList ModuleRoute))
+   (references (al/ArrayList Reference))
+   (sources (al/ArrayList Source))
+   (paths (al/ArrayList (slice u8)))
+   (folder-counts (al/ArrayList i64))
+   (folder-structures (al/ArrayList i64))
+   (folder-changed (al/ArrayList i64))
+   (folder-removed (al/ArrayList i64))
+   (impact ImpactGraph)
+   (label (slice u8))
+   (revision (slice u8))
+   (file-count i64)
+   (alc (dyn alloc/Allocator))])
+
+(defstruct Island
+  [(name (slice u8))
+   (seed i64)
+   (position r/Vector3)
+   (radius f64)
+   (count i64)
+   (changed i64)])
+
+(defstruct Revision [(oid (slice u8)) (title (slice u8)) (author (slice u8))])
+
+;;; Current-snapshot counts, not the history-wide layout registry. Removed
+;;; ghosts remain renderable but must not inflate a module's present inventory.
+(defn island-census [(snapshot (ptr Snapshot)) (island i64)] (-> (array i64 7))
+  (let [(mut counts) (zeroed (array i64 7))
+        entities (load (field snapshot entities))
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+      (let [e (al/al-get entities (load i))
+            kind (load (field e kind))]
+        (if (and (= (load (field e island)) island)
+                 (!= (load (field e state)) 3)
+                 (>= kind 0)
+                 (< kind 7))
+            (store! (index counts kind) (+ (load (index counts kind)) 1))
+            0))
+      (store! i (+ (load i) 1)))
+    (load counts)))
+
+(defn new-snapshot [(a (dyn alloc/Allocator))] (-> Snapshot)
+  (Snapshot
+    :entities (al/al-new [Entity] a)
+    :edges (al/al-new [Dependency] a)
+    :routes (al/al-new [ModuleRoute] a)
+    :references (al/al-new [Reference] a)
+    :sources (al/al-new [Source] a)
+    :paths (al/al-new [(slice u8)] a)
+    :folder-counts (al/al-new [i64] a)
+    :folder-structures (al/al-new [i64] a)
+    :folder-changed (al/al-new [i64] a)
+    :folder-removed (al/al-new [i64] a)
+    :impact
+      (ImpactGraph
+        :heads (al/al-new [i64] a)
+        :links (al/al-new [ImpactLink] a)
+        :unresolved 0
+        :ambiguous 0)
+    :label ""
+    :revision ""
+    :file-count 0
+    :alc a))
+
+(defn stable-hash [(text (slice u8))] (-> i64)
+  (& (str/str-hash text) 2147483647))
+
+(defn copy-text [(a (dyn alloc/Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (str/str-concat a text "")
+    (Some [s] s)
+    (None [] (do (alloc/abort) ""))))
+
+(defn copy-entity [(a (dyn alloc/Allocator)) (entity Entity)] (-> Entity)
+  (let [(mut out) (load entity)]
+    (store! (field out name) (copy-text a (load (field entity name))))
+    (store! (field out path) (copy-text a (load (field entity path))))
+    (store! (field out module) (copy-text a (load (field entity module))))
+    (store! (field out source) (copy-text a (load (field entity source))))
+    (store! (field out previous-source)
+            (copy-text a (load (field entity previous-source))))
+    (store! (field out details) (copy-details a (load (field entity details))))
+    (store! (field out previous-details)
+            (copy-details a (load (field entity previous-details))))
+    (store! (field out detail-changes) (al/al-new [MemberDelta] a))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (al/al-len (load (field entity detail-changes))))
+                (break 0)
+                0)
+        (al/al-push! (mut (field out detail-changes))
+                     (al/al-get (load (field entity detail-changes)) (load i)))
+        (store! i (+ (load i) 1))))
+    (load out)))
+
+(defn copy-details [(a (dyn alloc/Allocator))
+                    (details (al/ArrayList MemberDetail))] (-> (al/ArrayList MemberDetail))
+  (let [(mut out) (al/al-new [MemberDetail] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len details)) (break 0) 0)
+      (let [(mut detail) (al/al-get details (load i))]
+        (store! (field detail name) (copy-text a (load (field detail name))))
+        (store! (field detail signature)
+                (copy-text a (load (field detail signature))))
+        (al/al-push! (mut out) (load detail)))
+      (store! i (+ (load i) 1)))
+    (load out)))
+
+;;; -1 means absent; -2 means ambiguous (for example during an incomplete edit).
+(defn unique-member [(details (al/ArrayList MemberDetail)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len details)) (break (load found)) 0)
+      (let [detail (al/al-get details (load i))]
+        (if (str/str-eq name (load (field detail name)))
+            (if (>= (load found) 0) (break -2) (store! found (load i)))
+            0))
+      (store! i (+ (load i) 1)))))
+
+(defn compare-members! [(entity (ptr Entity)) (a (dyn alloc/Allocator))] (-> i64)
+  (let [current (load (field entity details))
+        previous (load (field entity previous-details))
+        known
+          (and (load (field entity details-known))
+               (load (field entity previous-details-known)))
+        removed (= (load (field entity state)) 3)
+        (mut changes) (al/al-new [MemberDelta] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len current)) (break 0) 0)
+      (let [detail (al/al-get current (load i))
+            at (unique-member previous (load (field detail name)))
+            unique
+              (= (unique-member current (load (field detail name))) (load i))
+            state
+              (cond removed 3
+                    (or (not known) (not unique) (= at -2)) 4
+                    (= at -1) 2
+                    :else
+                      (let [old (al/al-get previous at)
+                            hash (load (field detail fingerprint))]
+                        (if (if (and (!= hash 0)
+                                     (!= (load (field old fingerprint)) 0))
+                                (= hash (load (field old fingerprint)))
+                                (str/str-eq (load (field detail signature))
+                                            (load (field old signature))))
+                            0
+                            1)))]
+        (al/al-push! (mut changes)
+                     (MemberDelta
+                       :current (load i)
+                       :previous at
+                       :state state)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (if (and known (not removed))
+        (loop (if (>= (load i) (al/al-len previous)) (break 0) 0)
+          (let [detail (al/al-get previous (load i))]
+            (if (and (= (unique-member current (load (field detail name))) -1)
+                     (= (unique-member previous (load (field detail name)))
+                        (load i)))
+                (al/al-push! (mut changes)
+                             (MemberDelta
+                               :current -1
+                               :previous (load i)
+                               :state 3))
+                0))
+          (store! i (+ (load i) 1)))
+        0)
+    (store! (field entity detail-changes) (load changes))
+    0))
+
+(defn member-count [(entity Entity)] (-> i64)
+  (let [count (al/al-len (load (field entity detail-changes)))]
+    (if (> count 0) count (al/al-len (load (field entity details))))))
+
+(defn member-state [(entity Entity) (index i64)] (-> i64)
+  (if (> (al/al-len (load (field entity detail-changes))) 0)
+      (let [delta (al/al-get (load (field entity detail-changes)) index)]
+        (load (field delta state)))
+      4))
+
+(defn member-detail [(entity Entity) (index i64)] (-> MemberDetail)
+  (if (> (al/al-len (load (field entity detail-changes))) 0)
+      (let [delta (al/al-get (load (field entity detail-changes)) index)]
+        (if (>= (load (field delta current)) 0)
+            (al/al-get (load (field entity details))
+                       (load (field delta current)))
+            (al/al-get (load (field entity previous-details))
+                       (load (field delta previous)))))
+      (al/al-get (load (field entity details)) index)))
+
+(defn module-name [(path (slice u8))] (-> (slice u8))
+  (let [(mut last) -1
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len path)) (break 0) 0)
+      (if (= (cast i64 (slice-get path (load i))) 47) (store! last (load i)) 0)
+      (store! i (+ (load i) 1)))
+    (if (< (load last) 0) "root" (subslice path 0 (load last)))))
+
+(defn emit! [(sink (ptr Snapshot))
+             (path (slice u8))
+             (name (slice u8))
+             (kind i64)
+             (line i64)
+             (members i64)
+             (fingerprint i64)] (-> i64)
+  (let [module (module-name path)
+        id (^ (str/str-hash path) (* (str/str-hash name) 31))]
+    (al/al-push! (mut (field sink entities))
+                 (Entity
+                   :id id
+                   :name name
+                   :path path
+                   :module module
+                   :kind kind
+                   :line line
+                   :members members
+                   :details (al/al-new [MemberDetail] (load (field sink alc)))
+                   :details-known false
+                   :previous-details
+                     (al/al-new [MemberDetail] (load (field sink alc)))
+                   :previous-details-known false
+                   :detail-changes
+                     (al/al-new [MemberDelta] (load (field sink alc)))
+                   :fingerprint fingerprint
+                   :shape fingerprint
+                   :source ""
+                   :previous-source ""
+                   :previous-known false
+                   :state 0
+                   :island -1
+                   :position (r/v3 0.0 0.0 0.0)))))

@@ -1,0 +1,502 @@
+(module atlas.analyzer)
+(import "atlas.model" :as m)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use [slice-len slice-get subslice])
+
+;;; An adapter emits declarations and observed dependencies into snapshot-owned
+;;; storage. Implementations must be reentrant; no global parser state is allowed.
+(deftrait Analyzer [Self]
+  (analyze [(self (ptr Self))
+            (sink (ptr m/Snapshot))
+            (path (slice u8))
+            (source (slice u8))]
+           (-> i64)))
+
+(defstruct CoilAnalyzer [(version i64)])
+
+(defstruct CFamilyAnalyzer [(version i64)])
+
+(defstruct FileAnalyzer [(version i64)])
+
+(defstruct Registration [(suffix (slice u8)) (adapter (dyn Analyzer))])
+
+(defstruct Registry
+  [(entries (al/ArrayList Registration)) (fallback (dyn Analyzer))])
+
+(defn new-registry [(a (dyn alloc/Allocator)) (fallback (dyn Analyzer))] (-> Registry)
+  (Registry :entries (al/al-new [Registration] a) :fallback fallback))
+
+(defn register! [(registry (ptr Registry))
+                 (suffix (slice u8))
+                 (adapter (dyn Analyzer))] (-> i64)
+  (al/al-push! (mut (field registry entries))
+               (Registration :suffix suffix :adapter adapter)))
+
+(defn lookup [(registry (ptr Registry)) (path (slice u8))] (-> i64)
+  (let [(mut i) 0
+        n (slice-len path)]
+    (loop (if (>= (load i) (al/al-len (load (field registry entries))))
+              (break -1)
+              0)
+      (let [entry (al/al-get (load (field registry entries)) (load i))
+            suffix (load (field entry suffix))
+            k (slice-len suffix)]
+        (if (and (>= n k) (str/str-eq (subslice path (- n k) n) suffix))
+            (break (load i))
+            0))
+      (store! i (+ (load i) 1)))))
+
+(defn defaults [(a (dyn alloc/Allocator))] (-> Registry)
+  (let [coil-adapter (alloc/box! a CoilAnalyzer (CoilAnalyzer :version 1))
+        family (alloc/box! a CFamilyAnalyzer (CFamilyAnalyzer :version 1))
+        file (alloc/box! a FileAnalyzer (FileAnalyzer :version 1))
+        (mut registry) (new-registry a file)]
+    (register! (mut registry) ".coil" coil-adapter)
+    (register! (mut registry) ".rs" family)
+    (register! (mut registry) ".ts" family)
+    (register! (mut registry) ".tsx" family)
+    (register! (mut registry) ".js" family)
+    (register! (mut registry) ".c" family)
+    (register! (mut registry) ".h" family)
+    (register! (mut registry) ".cpp" family)
+    (load registry)))
+
+(defstruct Token
+  [(text (slice u8)) (line i64) (start i64) (end i64) (quoted bool)])
+
+(defn byte [(s (slice u8)) (i i64)] (-> i64)
+  (if (or (< i 0) (>= i (slice-len s))) 0 (cast i64 (slice-get s i))))
+
+(defn delimiter? [(c i64)] (-> bool)
+  (cond (<= c 32) true
+        (= c 40) true
+        (= c 41) true
+        (= c 91) true
+        (= c 93) true
+        (= c 123) true
+        (= c 125) true
+        (= c 59) true
+        (= c 44) true
+        (= c 34) true
+        :else false))
+
+(defn tokenize [(a (dyn alloc/Allocator)) (source (slice u8)) (coil? bool)] (-> (al/ArrayList Token))
+  (let [(mut out) (al/al-new [Token] a)
+        (mut i) 0
+        (mut line) 1
+        n (slice-len source)]
+    (loop (if (>= (load i) n) (break 0) 0)
+      (let [start (load i)
+            c (byte source start)
+            ln (load line)]
+        (cond (<= c 32)
+                (do
+                  (if (= c 10) (store! line (+ ln 1)) 0)
+                  (store! i (+ start 1)))
+              (or (and coil? (= c 59))
+                  (and (= c 47) (= (byte source (+ start 1)) 47)))
+                (loop (if (or (>= (load i) n) (= (byte source (load i)) 10))
+                          (break 0)
+                          0)
+                  (store! i (+ (load i) 1)))
+              (and (= c 47) (= (byte source (+ start 1)) 42))
+                (do
+                  (store! i (+ start 2))
+                  (loop (if (>= (load i) n) (break 0) 0)
+                    (if (and (= (byte source (load i)) 42)
+                             (= (byte source (+ (load i) 1)) 47))
+                        (do (store! i (+ (load i) 2)) (break 0))
+                        0)
+                    (if (= (byte source (load i)) 10)
+                        (store! line (+ (load line) 1))
+                        0)
+                    (store! i (+ (load i) 1))))
+              (or (= c 34) (and (not coil?) (or (= c 39) (= c 96))))
+                (let [(mut closed) false]
+                  (store! i (+ start 1))
+                  (loop (if (>= (load i) n) (break 0) 0)
+                    (let [v (byte source (load i))]
+                      (store! i (+ (load i) 1))
+                      (cond (= v c) (do (store! closed true) (break 0))
+                            (= v 92)
+                              (do
+                                (if (= (byte source (load i)) 10)
+                                    (store! line (+ (load line) 1))
+                                    0)
+                                (store! i (+ (load i) 1)))
+                            (= v 10) (store! line (+ (load line) 1))
+                            :else 0)))
+                  (let [end (if (> (load i) n) n (load i))]
+                    (al/al-push! (mut out)
+                                 (Token
+                                   :text
+                                     (subslice source
+                                               (+ start 1)
+                                               (if (load closed) (- end 1) end))
+                                   :line ln
+                                   :start start
+                                   :end end
+                                   :quoted true))))
+              :else
+                (do
+                  (store! i (+ start 1))
+                  (if (not (delimiter? c))
+                      (loop (if (or (>= (load i) n)
+                                    (delimiter? (byte source (load i))))
+                                (break 0)
+                                0)
+                        (store! i (+ (load i) 1)))
+                      0)
+                  (al/al-push! (mut out)
+                               (Token
+                                 :text (subslice source start (load i))
+                                 :line ln
+                                 :start start
+                                 :end (load i)
+                                 :quoted false)))))
+      0)
+    (load out)))
+
+(defn text-at [(ts (al/ArrayList Token)) (i i64)] (-> (slice u8))
+  (if (or (< i 0) (>= i (al/al-len ts)))
+      ""
+      (let [t (al/al-get ts i)] (load (field t text)))))
+
+(defn is? [(ts (al/ArrayList Token)) (i i64) (text (slice u8))] (-> bool)
+  (if (or (< i 0) (>= i (al/al-len ts)))
+      false
+      (let [token (al/al-get ts i)]
+        (and (not (load (field token quoted)))
+             (str/str-eq (load (field token text)) text)))))
+
+(defn form-end [(ts (al/ArrayList Token))
+                (start i64)
+                (open (slice u8))
+                (close (slice u8))] (-> i64)
+  (let [(mut i) (+ start 1)
+        (mut depth) 1]
+    (loop (if (or (>= (load i) (al/al-len ts)) (= (load depth) 0))
+              (break (load i))
+              0)
+      (cond (is? ts (load i) open) (store! depth (+ (load depth) 1))
+            (is? ts (load i) close) (store! depth (- (load depth) 1))
+            :else 0)
+      (store! i (+ (load i) 1)))))
+
+(defn token-hash [(ts (al/ArrayList Token)) (start i64) (end i64)] (-> i64)
+  (let [(mut i) start
+        (mut hash) 17]
+    (loop (if (>= (load i) end) (break (load hash)) 0)
+      (let [token (al/al-get ts (load i))]
+        (store! hash
+                (+ (* (load hash) 31)
+                   (^ (str/str-hash (load (field token text)))
+                      (if (load (field token quoted)) 9187 0)))))
+      (store! i (+ (load i) 1)))))
+
+;;; A bounded, mixed-delimiter reader for observed field syntax. It never
+;;; treats quoted delimiters as structure or reads beyond this declaration.
+;;; Excessively deep/incomplete forms return -1 rather than claiming coverage.
+(defn expression-end [(ts (al/ArrayList Token)) (start i64) (limit i64)] (-> i64)
+  (let [(mut stack) (zeroed (array i64 256))
+        (mut depth) 0
+        (mut i) start]
+    (loop (if (or (< (load i) 0)
+                  (>= (load i) limit)
+                  (>= (load i) (al/al-len ts)))
+              (break -1)
+              0)
+      (let [at (load i)
+            open
+              (cond (is? ts at "(") 41
+                    (is? ts at "[") 93
+                    (is? ts at "{") 125
+                    :else 0)
+            close
+              (cond (is? ts at ")") 41
+                    (is? ts at "]") 93
+                    (is? ts at "}") 125
+                    :else 0)]
+        (cond (> open 0)
+                (do
+                  (if (>= (load depth) 256) (break -1) 0)
+                  (store! (index stack (load depth)) open)
+                  (store! depth (+ (load depth) 1)))
+              (> close 0)
+                (do
+                  (if (or (= (load depth) 0)
+                          (!= close (load (index stack (- (load depth) 1)))))
+                      (break -1)
+                      0)
+                  (store! depth (- (load depth) 1)))
+              :else 0)
+        (store! i (+ at 1))
+        (if (= (load depth) 0) (break (load i)) 0)))))
+
+(defn field-name? [(ts (al/ArrayList Token)) (at i64)] (-> bool)
+  (let [name (text-at ts at)
+        token (al/al-get ts at)]
+    (and (> (slice-len name) 0)
+         (not (load (field token quoted)))
+         (not (delimiter? (byte name 0)))
+         (!= (byte name 0) 58))))
+
+(defn coil-fields! [(entity (ptr m/Entity))
+                    (source (slice u8))
+                    (ts (al/ArrayList Token))
+                    (start i64)
+                    (end i64)] (-> i64)
+  (block :fields
+           (let [(mut cursor) (+ start 3)]
+             ;; Struct options are keyword/value pairs before the optional generic vector.
+             (loop (if (or (>= (load cursor) end)
+                           (!= (byte (text-at ts (load cursor)) 0) 58))
+                       (break 0)
+                       0)
+               (let [next (expression-end ts (+ (load cursor) 1) end)]
+                 (if (< next 0) (break :fields 0) (store! cursor next))))
+             (if (not (is? ts (load cursor) "[")) (break :fields 0) 0)
+             (let [first-end (expression-end ts (load cursor) end)]
+               (if (and (> first-end 0) (is? ts first-end "["))
+                   (store! cursor first-end)
+                   0))
+             (let [vector-start (load cursor)
+                   vector-end (expression-end ts vector-start end)
+                   limit (if (> vector-end 0) (- vector-end 1) end)
+                   (mut valid) true]
+               (store! cursor (+ vector-start 1))
+               (loop (if (>= (load cursor) limit) (break 0) 0)
+                 (let [at (load cursor)
+                       next (expression-end ts at limit)]
+                   (if (or (not (is? ts at "("))
+                           (< next 0)
+                           (< (- next at) 4)
+                           (not (field-name? ts (+ at 1))))
+                       (do (store! valid false) (break 0))
+                       0)
+                   (let [name-token (al/al-get ts (+ at 1))
+                         first-token (al/al-get ts (+ at 2))
+                         last-token (al/al-get ts (- next 2))]
+                     (al/al-push! (field entity details)
+                                  (m/MemberDetail
+                                    :name (load (field name-token text))
+                                    :signature
+                                      (subslice source
+                                                (load (field first-token start))
+                                                (load (field last-token end)))
+                                    :line (load (field name-token line))
+                                    :fingerprint
+                                      (token-hash ts (+ at 2) (- next 1)))))
+                   (store! cursor next)))
+               (store! (field entity details-known)
+                       (and (load valid)
+                            (> vector-end 0)
+                            (= (expression-end ts start end) end)
+                            (is? ts vector-end ")")
+                            (= (+ vector-end 1) end))))
+             0)))
+
+;;; Recognize container shape from declared fields; leave ordinary records stacked.
+(defn structure-kind [(ts (al/ArrayList Token)) (start i64) (end i64)] (-> i64)
+  (let [(mut i) start
+        (mut kind) 0]
+    (loop (if (>= (load i) end) (break (load kind)) 0)
+      (cond (is? ts (load i) "children") (store! kind 3)
+            (is? ts (load i) "entries") (store! kind 2)
+            (is? ts (load i) "head") (store! kind 4)
+            (is? ts (load i) "edges") (store! kind 5)
+            :else 0)
+      (store! i (+ (load i) 1)))))
+
+(defn references! [(sink (ptr m/Snapshot))
+                   (ts (al/ArrayList Token))
+                   (start i64)
+                   (end i64)] (-> i64)
+  (let [e
+          (al/al-get (load (field sink entities))
+                     (- (al/al-len (load (field sink entities))) 1))
+        (mut i) start]
+    (loop (if (>= (load i) end) (break 0) 0)
+      (let [word (text-at ts (load i))
+            c (byte word 0)]
+        (if (and (>= c 65)
+                 (<= c 90)
+                 (not (str/str-eq word (load (field e name)))))
+            (al/al-push! (mut (field sink references))
+                         (m/Reference
+                           :source (load (field e id))
+                           :target word
+                           :module (load (field e module))))
+            0))
+      (store! i (+ (load i) 1)))
+    0))
+
+(impl Analyzer CoilAnalyzer
+  (analyze [(self (ptr CoilAnalyzer))
+            (sink (ptr m/Snapshot))
+            (path (slice u8))
+            (source (slice u8))]
+           (-> i64)
+           (let [ts (tokenize (load (field sink alc)) source true)
+                 (mut i) 0
+                 (mut count) 0
+                 module
+                   (if (and (is? ts 0 "(") (is? ts 1 "module"))
+                       (text-at ts 2)
+                       (m/module-name path))]
+             (loop (if (>= (load i) (al/al-len ts)) (break 0) 0)
+               (let [i (load i)
+                     word (text-at ts (+ i 1))
+                     kind
+                       (cond (str/str-eq word "defstruct") 0
+                             (str/str-eq word "defsum") 1
+                             (str/str-eq word "deftrait") 5
+                             (str/str-eq word "defn") 6
+                             :else -1)]
+                 (if (and (is? ts i "(") (>= kind 0))
+                     (let [end (form-end ts i "(" ")")
+                           tok (al/al-get ts i)]
+                       (m/emit! sink
+                                path
+                                (text-at ts (+ i 2))
+                                (if (= kind 0)
+                                    (structure-kind ts (+ i 3) end)
+                                    kind)
+                                (load (field tok line))
+                                (- end i)
+                                (token-hash ts i end))
+                       (let [entity
+                               (al/al-elem [m/Entity]
+                                           (field sink entities)
+                                           (- (al/al-len (load (field sink
+                                                                      entities)))
+                                              1))
+                             last-token (al/al-get ts (- end 1))]
+                         (store! (field entity module) module)
+                         (if (= kind 0) (coil-fields! entity source ts i end) 0)
+                         (store! (field entity shape)
+                                 (token-hash ts (+ i 3) end))
+                         (store! (field entity source)
+                                 (subslice source
+                                           (load (field tok start))
+                                           (load (field last-token end)))))
+                       (references! sink ts (+ i 3) end)
+                       (store! count (+ (load count) 1)))
+                     0)
+                 (if (and (is? ts i "(") (str/str-eq word "import"))
+                     (al/al-push! (mut (field sink edges))
+                                  (m/Dependency
+                                    :source module
+                                    :path path
+                                    :target (text-at ts (+ i 2))))
+                     0))
+               (store! i (+ (load i) 1)))
+             (load count))))
+
+(impl Analyzer CFamilyAnalyzer
+  (analyze [(self (ptr CFamilyAnalyzer))
+            (sink (ptr m/Snapshot))
+            (path (slice u8))
+            (source (slice u8))]
+           (-> i64)
+           (let [ts (tokenize (load (field sink alc)) source false)
+                 (mut i) 0
+                 (mut count) 0]
+             (loop (if (>= (load i) (al/al-len ts)) (break 0) 0)
+               (let [at (load i)
+                     kind
+                       (cond (or (is? ts at "struct") (is? ts at "class")) 0
+                             (is? ts at "enum") 1
+                             (is? ts at "type") 2
+                             (or (is? ts at "interface") (is? ts at "trait")) 5
+                             (or (is? ts at "fn") (is? ts at "function")) 6
+                             :else -1)]
+                 (if (>= kind 0)
+                     (let [(mut end) (+ at 2)]
+                       (loop (if (or (>= (load end) (al/al-len ts))
+                                     (or (is? ts (load end) "{")
+                                         (is? ts (load end) ";")))
+                                 (break 0)
+                                 0)
+                         (store! end (+ (load end) 1)))
+                       (let [end
+                               (if (is? ts (load end) "{")
+                                   (form-end ts (load end) "{" "}")
+                                   (load end))
+                             tok (al/al-get ts at)]
+                         (m/emit! sink
+                                  path
+                                  (text-at ts (+ at 1))
+                                  kind
+                                  (load (field tok line))
+                                  (- end at)
+                                  (token-hash ts at end))
+                         (let [entity
+                                 (al/al-elem [m/Entity]
+                                             (field sink entities)
+                                             (- (al/al-len (load (field sink
+                                                                        entities)))
+                                                1))
+                               last-token (al/al-get ts (- end 1))]
+                           (store! (field entity shape)
+                                   (token-hash ts (+ at 2) end))
+                           (store! (field entity source)
+                                   (subslice source
+                                             (load (field tok start))
+                                             (load (field last-token end))))))
+                       (store! count (+ (load count) 1)))
+                     0)
+                 (if (or (is? ts at "from") (is? ts at "use"))
+                     (al/al-push! (mut (field sink edges))
+                                  (m/Dependency
+                                    :source (m/module-name path)
+                                    :path path
+                                    :target (text-at ts (+ at 1))))
+                     0))
+               (store! i (+ (load i) 1)))
+             (load count))))
+
+(impl Analyzer FileAnalyzer
+  (analyze [(self (ptr FileAnalyzer))
+            (sink (ptr m/Snapshot))
+            (path (slice u8))
+            (source (slice u8))]
+           (-> i64)
+           (m/emit! sink
+                    path
+                    path
+                    2
+                    1
+                    (slice-len source)
+                    (m/stable-hash source))
+           1))
+
+(defn analyze-with [(adapter (dyn Analyzer))
+                    (sink (ptr m/Snapshot))
+                    (path (slice u8))
+                    (source (slice u8))] (-> i64)
+  (analyze adapter sink path source))
+
+(defn analyze-source! [(sink (ptr m/Snapshot))
+                       (path (slice u8))
+                       (source (slice u8))] (-> i64)
+  (let [(mut registry) (defaults (load (field sink alc)))]
+    (analyze-registered! (mut registry) sink path source)))
+
+(defn analyze-registered! [(registry (ptr Registry))
+                           (sink (ptr m/Snapshot))
+                           (path (slice u8))
+                           (source (slice u8))] (-> i64)
+  (let [at (lookup registry path)
+        count
+          (if (< at 0)
+              0
+              (let [entry (al/al-get (load (field registry entries)) at)]
+                (analyze-with (load (field entry adapter)) sink path source)))]
+    (al/al-push! (mut (field sink sources)) (m/Source :path path :text source))
+    (store! (field sink file-count) (+ (load (field sink file-count)) 1))
+    (if (= count 0)
+        (analyze-with (load (field registry fallback)) sink path source)
+        count)))

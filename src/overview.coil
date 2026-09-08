@@ -1,0 +1,204 @@
+(module atlas.overview)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+
+;;; A visual aggregate is not a declaration and must never enter a Snapshot.
+;;; Groups have stable island/kind slots, even while empty. Membership indices
+;;; borrow the snapshot's ordering; rebuild alongside snapshot publication.
+(defstruct Group
+  [(island i64)
+   (kind i64)
+   (counts (array i64 4))
+   (present i64)
+   (total i64)
+   (head i64)
+   (tail i64)
+   (focus r/Vector3)])
+
+(defstruct Overview
+  [(groups (al/ArrayList Group))
+   (next (al/ArrayList i64))
+   (unmapped i64)])
+
+(defn build [(snapshot (ptr m/Snapshot))
+             (island-count i64)
+             (a (dyn alloc/Allocator))] (-> Overview)
+  (let [(mut out) (zeroed Overview)
+        entities (load (field snapshot entities))
+        (mut i) 0]
+    (store! (field out groups) (al/al-new [Group] a))
+    (store! (field out next) (al/al-new [i64] a))
+    (loop (if (>= (load i) (* island-count 7)) (break 0) 0)
+      (al/al-push! (mut (field out groups))
+                   (Group
+                     :island (/ (load i) 7)
+                     :kind (% (load i) 7)
+                     :counts (zeroed (array i64 4))
+                     :present 0
+                     :total 0
+                     :head -1
+                     :tail -1
+                     :focus (r/v3 0.0 0.0 0.0)))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+      (al/al-push! (mut (field out next)) -1)
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+      (let [e (al/al-get entities (load i))
+            island (load (field e island))
+            kind (load (field e kind))
+            state (load (field e state))]
+        (if (and (>= island 0)
+                 (< island island-count)
+                 (>= kind 0)
+                 (< kind 7)
+                 (>= state 0)
+                 (< state 4))
+            (let [g
+                    (al/al-elem [Group]
+                                (mut (field out groups))
+                                (+ (* island 7) kind))
+                  tail (load (field g tail))]
+              (if (>= tail 0)
+                  (store! (al/al-elem [i64] (mut (field out next)) tail)
+                          (load i))
+                  (store! (field g head) (load i)))
+              (store! (field g tail) (load i))
+              (store! (field g total) (+ (load (field g total)) 1))
+              (store! (index (field g counts) state)
+                      (+ (load (index (field g counts) state)) 1))
+              (if (!= state 3)
+                  (store! (field g present) (+ (load (field g present)) 1))
+                  0))
+            (store! (field out unmapped) (+ (load (field out unmapped)) 1))))
+      (store! i (+ (load i) 1)))
+    ;; Navigation goes to real source positions, not the symbolic group slot.
+    ;; Removal-only groups focus their retained ghosts; mixed groups focus live
+    ;; declarations so a deleted outlier cannot drag the camera away from them.
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field out groups)))) (break 0) 0)
+      (let [g (al/al-elem [Group] (mut (field out groups)) (load i))
+            (mut at) (load (field g head))
+            (mut x) 0.0
+            (mut y) 0.0
+            (mut z) 0.0
+            count
+              (if (> (load (field g present)) 0)
+                  (load (field g present))
+                  (load (field g total)))]
+        (loop (if (< (load at) 0) (break 0) 0)
+          (let [e (al/al-get entities (load at))
+                p (load (field e position))]
+            (if (or (= (load (field g present)) 0)
+                    (!= (load (field e state)) 3))
+                (do
+                  (store! x (+ (load x) (cast f64 (load (field p x)))))
+                  (store! y (+ (load y) (cast f64 (load (field p y)))))
+                  (store! z (+ (load z) (cast f64 (load (field p z))))))
+                0))
+          (store! at (al/al-get (load (field out next)) (load at))))
+        (if (> count 0)
+            (store! (field g focus)
+                    (r/v3 (/ (load x) (cast f64 count))
+                          (/ (load y) (cast f64 count))
+                          (/ (load z) (cast f64 count))))
+            0))
+      (store! i (+ (load i) 1)))
+    (load out)))
+
+(defn close! [(overview (ptr Overview))] (-> i64)
+  (al/al-free! (mut (field overview groups)))
+  (al/al-free! (mut (field overview next)))
+  0)
+
+;;; One central record landmark plus six fixed satellite slots. Empty kinds
+;;; leave their slots vacant: adding/removing a kind never moves its neighbors.
+;;; Seeded radial/angular variation avoids a perfect hexagon without depending
+;;; on counts. Complete disks lie within 0.625 R, inside the minimum plateau.
+(defn anchor [(island m/Island) (kind i64)] (-> r/Vector3)
+  (let [center (load (field island position))
+        phase
+          (+ (* (cast f64 (% (load (field island seed)) 997)) 0.031)
+             (* (cast f64 kind) 2.3))
+        radius
+          (* (+ 0.45 (* 0.035 (r/sin phase)))
+             (load (field island radius)))
+        angle
+          (+ (* (cast f64 (% (load (field island seed)) 997)) 0.006302894)
+             (+ (* (cast f64 (- kind 1)) 1.047197551196598)
+                (* 0.12 (r/cos (* phase 1.7)))))]
+    (r/v3 (+ (cast f64 (load (field center x)))
+             (if (= kind 0) 0.0 (* radius (r/cos angle))))
+          1.99
+          (+ (cast f64 (load (field center z)))
+             (if (= kind 0) 0.0 (* radius (r/sin angle)))))))
+
+(defn footprint [(island m/Island) (kind i64)] (-> f64)
+  (* (load (field island radius)) (if (= kind 0) 0.21 0.14)))
+
+;;; Signed distance to the nearest occupied landmark footprint (not its center).
+;;; Seven analytic disks keep terrain preparation independent of sample density.
+(defn clearance [(p r/Vector3) (island m/Island) (kinds (array bool 7))] (-> f64)
+  (let [(mut nearest) 1000000.0
+        (mut kind) 0]
+    (loop (if (>= (load kind) 7) (break 0) 0)
+      (if (load (index kinds (load kind)))
+          (let [distance
+                  (- (r/sqrt (r/distance2 p (anchor island (load kind))))
+                     (footprint island (load kind)))]
+            (if (< distance (load nearest)) (store! nearest distance) 0))
+          0)
+      (store! kind (+ (load kind) 1)))
+    (load nearest)))
+
+;;; Overview tiers encode aggregate cardinality, not fields of a declaration.
+(defn levels [(group Group)] (-> i64)
+  (cast i64
+        (r/clamp (+ 3.0 (r/sqrt (cast f64 (load (field group total)))))
+                 3.0
+                 11.0)))
+
+;;; The body indicates contained changes; exact state counts remain separate.
+(defn state [(group Group)] (-> i64)
+  (cond (= (load (field group present)) 0) 3
+        (= (load (field group present)) (load (index (field group counts) 2))) 2
+        (> (+ (load (index (field group counts) 1))
+              (+ (load (index (field group counts) 2))
+                 (load (index (field group counts) 3))))
+           0)
+          1
+        :else 0))
+
+;;; Include the complete symbol envelope, not only its ground foundation.
+(defn symbol-radius [(bounds r/BoundingBox)] (-> f64)
+  (let [lo (load (field bounds min))
+        hi (load (field bounds max))
+        ax (r/fabs (cast f64 (load (field lo x))))
+        bx (r/fabs (cast f64 (load (field hi x))))
+        az (r/fabs (cast f64 (load (field lo z))))
+        bz (r/fabs (cast f64 (load (field hi z))))
+        x (if (> ax bx) ax bx)
+        z (if (> az bz) az bz)]
+    (r/sqrt (+ (* x x) (* z z)))))
+
+(defn scale [(island m/Island) (kind i64) (bounds r/BoundingBox)] (-> f64)
+  (let [radius (symbol-radius bounds)]
+    (if (> radius 0.0) (/ (footprint island kind) radius) 1.0)))
+
+;;; Uniform scale about the symbol's foundation plane, then world translation.
+;;; This same transform is intended for vertices, lighting, shadows and picking.
+(defn point [(local r/Vector3) (anchor r/Vector3) (scale f64)] (-> r/Vector3)
+  (r/v3 (+ (cast f64 (load (field anchor x)))
+           (* scale (cast f64 (load (field local x)))))
+        (+ (cast f64 (load (field anchor y)))
+           (* scale (- (cast f64 (load (field local y))) 1.99)))
+        (+ (cast f64 (load (field anchor z)))
+           (* scale (cast f64 (load (field local z)))))))
+
+(defn bounds [(local r/BoundingBox) (anchor r/Vector3) (scale f64)] (-> r/BoundingBox)
+  (r/BoundingBox :min (point (load (field local min)) anchor scale)
+    :max (point (load (field local max)) anchor scale)))

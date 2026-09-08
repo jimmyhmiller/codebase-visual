@@ -1,0 +1,288 @@
+(module atlas.tests.folders)
+(import "atlas.folders" :as folders)
+(import "atlas.world" :as world)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+
+(deftest path-can-change-between-file-and-directory-through-history
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut old) (m/new-snapshot a)
+                 (mut next) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut old)
+                                       "same.coil"
+                                       "(defstruct A [(id i64)])")
+             (analyzer/analyze-source! (mut next)
+                                       "same.coil/child.coil"
+                                       "(defstruct B [(other bool)])")
+             (world/register! (mut w) (mut old))
+             (world/register! (mut w) (mut next))
+             (world/pack! (mut w))
+             (world/prepare-routes! (mut w) (mut old))
+             (world/prepare-routes! (mut w) (mut next))
+             (let [directory (folders/find (mut (field w folders)) "same.coil")
+                   file (folders/find-file (mut (field w folders)) "same.coil")]
+               (assert (!= directory file))
+               (assert-eq (folders/count-at (mut old) directory) 0)
+               (assert-eq (folders/count-at (mut old) file) 1)
+               (assert-eq (folders/count-at (mut next) directory) 1)
+               (assert-eq (folders/count-at (mut next) file) 0)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest live-folder-layout-is-owned-after-worker-arena-closes
+         (let [(mut arena) (zeroed scratch/ScratchArena)
+               (mut worker) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (scratch/scratch-init (mut worker) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 b (scratch/scratch-allocator (mut worker))
+                 (mut w) (world/new-world a)
+                 (mut old) (m/new-snapshot a)
+                 (mut next) (m/new-snapshot b)]
+             (analyzer/analyze-source! (mut old)
+                                       "src/a.coil"
+                                       "(defstruct A [(id i64)])")
+             (world/register! (mut w) (mut old))
+             (world/pack! (mut w))
+             (analyzer/analyze-source! (mut next)
+                                       "src/a.coil"
+                                       "(defstruct A [(id i64)])")
+             (analyzer/analyze-source! (mut next)
+                                       "src/new/b.coil"
+                                       "(defstruct B [(id i64)])")
+             (let [(mut staged) (world/copy-layout (mut w) b)]
+               (world/register-live! (mut staged) (mut next))
+               (world/adopt-layout! (mut w) (mut staged)))
+             (scratch/scratch-close! (mut worker))
+             (let [at (folders/find (mut (field w folders)) "src/new")
+                   file
+                     (folders/find-file (mut (field w folders))
+                                        "src/new/b.coil")
+                   node (al/al-get (load (field (field w folders) nodes)) at)]
+               (assert (>= at 0))
+               (assert (folders/descendant? (mut (field w folders)) file at))
+               (assert (> (load (field node radius)) 0.0))
+               (world/apply-layout! (mut w) (mut old))
+               (world/prepare-routes! (mut w) (mut old))
+               (assert-eq (folders/count-at (mut old) at) 0)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest inherited-hidden-state-applies-to-new-live-descendants
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut old) (m/new-snapshot a)
+                 (mut next) (m/new-snapshot a)
+                 (mut state) (folders/new-state)]
+             (analyzer/analyze-source! (mut old)
+                                       "src/a.coil"
+                                       "(defstruct A [(id i64)])")
+             (world/register! (mut w) (mut old))
+             (world/pack! (mut w))
+             (world/prepare-routes! (mut w) (mut old))
+             (folders/refresh! (mut state) (mut (field w folders)) (mut old) 1)
+             (folders/toggle! (mut state)
+                              (mut (field w folders))
+                              (mut old)
+                              (folders/find (mut (field w folders)) "src"))
+             (analyzer/analyze-source! (mut next)
+                                       "src/new/b.coil"
+                                       "(defstruct B [(id i64)])")
+             (world/register-live! (mut w) (mut next))
+             (world/prepare-routes! (mut w) (mut next))
+             (folders/refresh! (mut state) (mut (field w folders)) (mut next) 2)
+             (assert (not (al/al-get (load (field state islands)) 1)))
+             (folders/toggle! (mut state) (mut (field w folders)) (mut next) 0)
+             (folders/refresh! (mut state) (mut (field w folders)) (mut next) 2)
+             (assert (al/al-get (load (field state islands)) 1))
+             (folders/close! (mut state)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest folder-paths-use-components-and-stable-identities
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut tree) (folders/new-tree a)
+                 one (folders/register! (mut tree) "src/parser/parse.coil")
+                 two (folders/register! (mut tree) "src2/parse.coil")
+                 root-file (folders/register! (mut tree) "README.md")
+                 src (folders/find (mut tree) "src")]
+             (assert (folders/descendant? (mut tree) one src))
+             (assert (not (folders/descendant? (mut tree) two src)))
+             (assert (not (folders/descendant? (mut tree) root-file src)))
+             (assert-eq (folders/register! (mut tree) "src/parser/parse.coil")
+                        one)
+             (let [(mut copy) (folders/copy-tree (mut tree) a)]
+               (assert-eq (folders/find (mut copy) "src/parser/parse.coil") one)
+               (assert-eq (folders/find (mut copy) "src") src)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest folder-history-and-visibility-are-independent
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut old) (m/new-snapshot a)
+                 (mut next) (m/new-snapshot a)
+                 (mut state) (folders/new-state)]
+             (analyzer/analyze-source! (mut old)
+                                       "src/old.coil"
+                                       "(module shared) (defstruct Old [(a i64)])")
+             (analyzer/analyze-source! (mut next)
+                                       "src/new/new.coil"
+                                       "(module shared) (defstruct New [(b bool)])")
+             (al/al-push! (mut (field next paths)) "docs/guide.md")
+             (world/register! (mut w) (mut old))
+             (world/reconcile! (mut old) (mut next))
+             (world/register! (mut w) (mut next))
+             (world/pack! (mut w))
+             (world/apply-layout! (mut w) (mut old))
+             (world/apply-layout! (mut w) (mut next))
+             (world/prepare-routes! (mut w) (mut old))
+             (world/prepare-routes! (mut w) (mut next))
+             (let [src (folders/find (mut (field w folders)) "src")
+                   new-folder (folders/find (mut (field w folders)) "src/new")
+                   docs (folders/find (mut (field w folders)) "docs")
+                   old-island (world/find-island (mut w) "src/old.coil")
+                   new-island (world/find-island (mut w) "src/new/new.coil")]
+               (assert-eq (folders/count-at (mut old) new-folder) 0)
+               (assert-eq (folders/count-at (mut next) new-folder) 1)
+               (assert-eq (folders/count-at (mut next) docs) 1)
+               (folders/refresh! (mut state)
+                                 (mut (field w folders))
+                                 (mut next)
+                                 2)
+               (assert (not (al/al-get (load (field state islands)) old-island)))
+               (assert (al/al-get (load (field state islands)) new-island))
+               (folders/toggle! (mut state)
+                                (mut (field w folders))
+                                (mut next)
+                                src)
+               (folders/refresh! (mut state)
+                                 (mut (field w folders))
+                                 (mut old)
+                                 2)
+               (assert (not (al/al-get (load (field state islands)) old-island)))
+               (folders/refresh! (mut state)
+                                 (mut (field w folders))
+                                 (mut next)
+                                 2)
+               (assert (not (al/al-get (load (field state islands)) new-island)))
+               (assert-eq (al/al-get (load (field state shown)) docs) 1)
+               (folders/toggle! (mut state)
+                                (mut (field w folders))
+                                (mut next)
+                                new-folder)
+               (folders/refresh! (mut state)
+                                 (mut (field w folders))
+                                 (mut next)
+                                 2)
+               (assert (al/al-get (load (field state islands)) new-island)))
+             (folders/close! (mut state)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest nested-reservations-contain-children-and-separate-siblings
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut s) (m/new-snapshot a)
+                 (mut i) 1]
+             (analyzer/analyze-source! (mut s)
+                                       "src/a.coil"
+                                       "(module same) (defstruct A [(id i64)])")
+             (analyzer/analyze-source! (mut s)
+                                       "src/deep/b.coil"
+                                       "(module same) (defstruct B [(id i64)])")
+             (analyzer/analyze-source! (mut s)
+                                       "tests/c.coil"
+                                       "(module same) (defstruct C [(id i64)])")
+             (world/register! (mut w) (mut s))
+             (world/pack! (mut w))
+             (let [nodes (load (field (field w folders) nodes))]
+               (loop (if (>= (load i) (al/al-len nodes)) (break 0) 0)
+                 (let [node (al/al-get nodes (load i))
+                       parent (al/al-get nodes (load (field node parent)))
+                       (mut j) (+ (load i) 1)]
+                   (assert (<= (+ (r/sqrt (r/distance2 (load (field node
+                                                                    position))
+                                                       (load (field parent
+                                                                    position))))
+                                  (load (field node radius)))
+                               (+ 0.001 (load (field parent radius)))))
+                   (loop (if (>= (load j) (al/al-len nodes)) (break 0) 0)
+                     (let [other (al/al-get nodes (load j))]
+                       (if (= (load (field node parent))
+                              (load (field other parent)))
+                           (assert (> (r/sqrt (r/distance2 (load (field node
+                                                                        position))
+                                                           (load (field other
+                                                                        position))))
+                                      (+ (load (field node radius))
+                                         (load (field other radius)))))
+                           0))
+                     (store! j (+ (load j) 1))))
+                 (store! i (+ (load i) 1)))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest moved-file-keeps-identity-but-uses-revision-correct-island
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut old) (m/new-snapshot a)
+                 (mut next) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut old)
+                                       "old/a.coil"
+                                       "(module same) (defstruct A [(id i64)])")
+             (analyzer/analyze-source! (mut next)
+                                       "new/a.coil"
+                                       "(module same) (defstruct A [(id i64)])")
+             (world/reconcile! (mut old) (mut next))
+             (world/register! (mut w) (mut old))
+             (world/register! (mut w) (mut next))
+             (world/pack! (mut w))
+             (world/apply-layout! (mut w) (mut old))
+             (world/apply-layout! (mut w) (mut next))
+             (let [before (al/al-get (load (field old entities)) 0)
+                   after (al/al-get (load (field next entities)) 0)]
+               (assert-eq (load (field before id)) (load (field after id)))
+               (assert (!= (load (field before island))
+                           (load (field after island)))))
+             (world/prepare-routes! (mut w) (mut old))
+             (world/prepare-routes! (mut w) (mut next))
+             (assert-eq (folders/count-at (mut next)
+                                          (folders/find (mut (field w folders))
+                                                        "old"))
+                        0))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest module-dependencies-connect-all-file-islands-without-duplicates
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut s)
+                                       "src/a.coil"
+                                       "(module shared) (import \"target\") (defstruct A [(id i64)])")
+             (analyzer/analyze-source! (mut s)
+                                       "src/b.coil"
+                                       "(module shared) (import \"target\") (defstruct B [(id i64)])")
+             (analyzer/analyze-source! (mut s)
+                                       "lib/c.coil"
+                                       "(module target) (defstruct C [(id i64)])")
+             (world/register! (mut w) (mut s))
+             (world/pack! (mut w))
+             (world/apply-layout! (mut w) (mut s))
+             (world/prepare-routes! (mut w) (mut s))
+             (assert-eq (al/al-len (load (field w islands))) 3)
+             (assert-eq (al/al-len (load (field s routes))) 2))
+           (scratch/scratch-close! (mut arena))))

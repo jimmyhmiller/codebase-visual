@@ -1,0 +1,36 @@
+(module atlas.tests.transport)
+(import "atlas.view" :as view)
+(import "atlas.ray" :as r)
+
+(deftest transport-controls-have-distinct-bounded-hit-areas
+         (let [(mut size) 0]
+           (loop (if (>= (load size) 3) (break 0) 0)
+             (let [width (+ 1100.0 (* (cast f64 (load size)) 250.0))
+                   height (+ 720.0 (* (cast f64 (load size)) 140.0))
+                   (mut i) 0]
+               (loop (if (>= (load i) 5) (break 0) 0)
+                 (let [box (view/transport-bounds width height (load i))
+                       x (cast f64 (load (field box x)))
+                       y (cast f64 (load (field box y)))]
+                   (assert (= (view/transport-action width
+                                                     height
+                                                     (r/v2 (+ x 14.0)
+                                                           (+ y 14.0)))
+                              (+ (load i) 1)))
+                   (assert (= (view/transport-action width
+                                                     height
+                                                     (r/v2 (+ x 14.0) (- y 1.0)))
+                              0))
+                   (assert (= (view/transport-action width
+                                                     height
+                                                     (r/v2 (+ x 14.0)
+                                                           (+ y 28.0)))
+                              0))
+                   (assert (> x 0.0))
+                   (assert (< (+ x 28.0) width)))
+                 (store! i (+ (load i) 1)))
+               (assert (= (view/transport-action width
+                                                 height
+                                                 (r/v2 300.0 (- height 70.0)))
+                          0)))
+             (store! size (+ (load size) 1)))))

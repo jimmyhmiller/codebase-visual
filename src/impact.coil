@@ -1,0 +1,208 @@
+(module atlas.impact)
+(import "atlas.model" :as m)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.hashmap" :as hm)
+(import "coil.primitive" :as primitive)
+
+;;; Content equality, never slice-address or padded-struct equality. Keeping
+;;; module/name separate also avoids ambiguous concatenated composite keys.
+(defstruct NameKey [(module (slice u8)) (name (slice u8))])
+
+(defn name-hash [(raw (ptr i8)) (size i64)] (-> i64)
+  (let [key (cast (ptr NameKey) raw)]
+    (primitive/ixor (primitive/imul (str/str-hash (load (field key module)))
+                                    1099511628211)
+                    (str/str-hash (load (field key name))))))
+
+(defn name-equal [(a (ptr i8)) (b (ptr i8)) (size i64)] (-> bool)
+  (let [x (cast (ptr NameKey) a)
+        y (cast (ptr NameKey) b)]
+    (and (str/str-eq (load (field x module)) (load (field y module)))
+         (str/str-eq (load (field x name)) (load (field y name))))))
+
+(defn name-value [(table (hm/HashMap NameKey i64)) (key NameKey)] (-> i64)
+  (match (hm/hm-get table key) (Some [value] value) (None [] -1)))
+
+(defn insert-name! [(table (ptr (hm/HashMap NameKey i64)))
+                    (key NameKey)
+                    (index i64)] (-> i64)
+  (hm/hm-put! table key (if (= (name-value (load table) key) -1) index -2)))
+
+;;; Reverse adjacency: target -> declarations that reference it. Only unique
+;;; lexical names resolve. This is possible impact, not a verified call graph.
+(defstruct Summary [(direct i64) (indirect i64) (available bool)])
+
+(defn empty [(a (dyn alloc/Allocator))] (-> m/ImpactGraph)
+  (m/ImpactGraph
+    :heads (al/al-new [i64] a)
+    :links (al/al-new [m/ImpactLink] a)
+    :unresolved 0
+    :ambiguous 0))
+
+(defn free! [(graph (ptr m/ImpactGraph))] (-> i64)
+  (al/al-free! (mut (field graph heads)))
+  (al/al-free! (mut (field graph links)))
+  0)
+
+;;; Same-module uniqueness takes precedence; otherwise require a globally
+;;; unique name. -1 is absent, -2 ambiguous. Removed ghosts are not targets.
+(defn resolve [(entities (al/ArrayList m/Entity))
+               (name (slice u8))
+               (module (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut local) -1
+        (mut global) -1]
+    (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+      (let [e (al/al-get entities (load i))]
+        (if (and (!= (load (field e state)) 3)
+                 (str/str-eq name (load (field e name))))
+            (do
+              (store! global (if (= (load global) -1) (load i) -2))
+              (if (str/str-eq module (load (field e module)))
+                  (store! local (if (= (load local) -1) (load i) -2))
+                  0))
+            0))
+      (store! i (+ (load i) 1)))
+    (if (!= (load local) -1) (load local) (load global))))
+
+(defn build [(snapshot (ptr m/Snapshot))] (-> m/ImpactGraph)
+  (let [(mut graph) (empty (load (field snapshot alc)))
+        entities (load (field snapshot entities))
+        refs (load (field snapshot references))
+        (mut name-ops) (zeroed hm/KeyOps)
+        (mut id-ops) (zeroed hm/KeyOps)
+        (mut i) 0]
+    ;; Per-call capabilities avoid mutable global initialization on workers.
+    ;; Borrowed keys are valid until all temporary tables are freed below.
+    (store! (field name-ops hash) (primitive/fnptr-of name-hash))
+    (store! (field name-ops eq) (primitive/fnptr-of name-equal))
+    (store! (field name-ops size) (primitive/sizeof NameKey))
+    (store! (field id-ops hash) (primitive/fnptr-of hm/i64-key-hash))
+    (store! (field id-ops eq) (primitive/fnptr-of hm/i64-key-eq))
+    (store! (field id-ops size) (primitive/sizeof i64))
+    (let [(mut locals)
+            (hm/hm-new [NameKey i64] (alloc/malloc-allocator) (mut name-ops))
+          (mut globals)
+            (hm/hm-new [NameKey i64] (alloc/malloc-allocator) (mut name-ops))
+          (mut sources)
+            (hm/hm-new [i64 i64] (alloc/malloc-allocator) (mut id-ops))]
+      (loop (if (>= (load i) (al/al-len entities)) (break 0) 0)
+        (al/al-push! (mut (field graph heads)) -1)
+        (let [entity (al/al-get entities (load i))
+              id (load (field entity id))
+              name (load (field entity name))]
+          (if (!= (load (field entity state)) 3)
+              (do
+                (insert-name! (mut locals)
+                              (NameKey :module (load (field entity module))
+                                :name name)
+                              (load i))
+                (insert-name! (mut globals)
+                              (NameKey :module "" :name name)
+                              (load i))
+                (match (hm/hm-get (load sources) id)
+                  (Some [_] 0)
+                  (None [] (hm/hm-put! (mut sources) id (load i)))))
+              0))
+        (store! i (+ (load i) 1)))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len refs)) (break 0) 0)
+        (let [ref (al/al-get refs (load i))
+              local
+                (name-value (load locals)
+                            (NameKey :module (load (field ref module))
+                              :name (load (field ref target))))
+              target
+                (if (!= local -1)
+                    local
+                    (name-value (load globals)
+                                (NameKey :module ""
+                                  :name (load (field ref target)))))
+              source
+                (match (hm/hm-get (load sources) (load (field ref source)))
+                  (Some [value] value)
+                  (None [] -1))]
+          (cond (= target -2)
+                  (store! (field graph ambiguous)
+                          (+ (load (field graph ambiguous)) 1))
+                (or (< target 0) (< source 0))
+                  (store! (field graph unresolved)
+                          (+ (load (field graph unresolved)) 1))
+                (!= target source)
+                  (let [head (al/al-get (load (field graph heads)) target)
+                        next (al/al-len (load (field graph links)))]
+                    (al/al-push! (mut (field graph links))
+                                 (m/ImpactLink :source source :next head))
+                    (store! (al/al-elem [i64] (field graph heads) target) next))
+                :else 0))
+        (store! i (+ (load i) 1)))
+      (hm/hm-free! (mut locals))
+      (hm/hm-free! (mut globals))
+      (hm/hm-free! (mut sources)))
+    (load graph)))
+
+;;; BFS visits each dependent once, so diamonds, duplicate references and
+;;; cycles neither inflate counts nor change shortest dependency distance.
+(defn prepare! [(snapshot (ptr m/Snapshot))] (-> i64)
+  (free! (field snapshot impact))
+  (store! (field snapshot impact) (build snapshot))
+  0)
+
+(defn summarize [(graph (ptr m/ImpactGraph))
+                 (snapshot (ptr m/Snapshot))
+                 (selected i64)] (-> Summary)
+  (summarize-into graph snapshot selected (cast (ptr (al/ArrayList i64)) 0)))
+
+;;; Optional ownership transfer lets the world markers reuse the same BFS as
+;;; the counts. Caller supplies an empty list and frees the returned distances.
+(defn summarize-into [(graph (ptr m/ImpactGraph))
+                      (snapshot (ptr m/Snapshot))
+                      (selected i64)
+                      (out (ptr (al/ArrayList i64)))] (-> Summary)
+  (let [entities (load (field snapshot entities))
+        n (al/al-len entities)
+        (mut result) (zeroed Summary)]
+    (if (and (= n (al/al-len (load (field graph heads))))
+             (and (>= selected 0) (< selected n)))
+        (let [entity (al/al-get entities selected)]
+          (if (!= (load (field entity state)) 3)
+              (let [(mut distances) (al/al-new [i64] (alloc/malloc-allocator))
+                    (mut queue) (al/al-new [i64] (alloc/malloc-allocator))
+                    (mut i) 0]
+                (store! (field result available) true)
+                (loop (if (>= (load i) n) (break 0) 0)
+                  (al/al-push! (mut distances) -1)
+                  (store! i (+ (load i) 1)))
+                (store! (al/al-elem [i64] (mut distances) selected) 0)
+                (al/al-push! (mut queue) selected)
+                (store! i 0)
+                (loop (if (>= (load i) (al/al-len (load queue))) (break 0) 0)
+                  (let [node (al/al-get (load queue) (load i))
+                        distance (+ (al/al-get (load distances) node) 1)
+                        (mut edge) (al/al-get (load (field graph heads)) node)]
+                    (loop (if (< (load edge) 0) (break 0) 0)
+                      (let [link
+                              (al/al-get (load (field graph links)) (load edge))
+                            source (load (field link source))]
+                        (if (< (al/al-get (load distances) source) 0)
+                            (do
+                              (store! (al/al-elem [i64] (mut distances) source)
+                                      distance)
+                              (al/al-push! (mut queue) source)
+                              (if (= distance 1)
+                                  (store! (field result direct)
+                                          (+ (load (field result direct)) 1))
+                                  (store! (field result indirect)
+                                          (+ (load (field result indirect)) 1))))
+                            0)
+                        (store! edge (load (field link next))))))
+                  (store! i (+ (load i) 1)))
+                (if (= out (cast (ptr (al/ArrayList i64)) 0))
+                    (al/al-free! (mut distances))
+                    (store! out (load distances)))
+                (al/al-free! (mut queue)))
+              0))
+        0)
+    (load result)))

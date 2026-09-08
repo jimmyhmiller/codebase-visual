@@ -1,0 +1,159 @@
+(module atlas.tests.repository)
+(import "atlas.repository" :as git)
+(import "atlas.demo" :as demo)
+(import "atlas.live" :as live)
+(import "atlas.model" :as m)
+(import "atlas.world" :as world)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+
+(cimport "unistd.h" :use [mkdtemp unlink])
+
+(deftest prepared-live-job-stages-layout-and-skips-unchanged-geometry
+         (git/git_libgit2_init)
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 directory
+                   (mkdtemp (str/str->cstr a "build/atlas-stage-test-XXXXXX"))
+                 _ (assert (!= (cast i64 directory) 0))
+                 created (demo/ensure-at! a (str/cstr->str directory))
+                 checked (assert-eq created 0)
+                 repo (git/open directory)
+                 revisions (git/history a repo 24)
+                 (mut head)
+                   (git/snapshot a
+                                 repo
+                                 (al/al-get revisions
+                                            (- (al/al-len revisions) 1)))
+                 (mut w) (world/new-world a)
+                 first (live/new-job a repo)
+                 second (live/new-job a repo)
+                 probe
+                   (str/str->cstr a
+                                  (git/concat a
+                                              (str/cstr->str directory)
+                                              "/order/staged.coil"))]
+             (world/register! (mut w) (mut head))
+             (world/pack! (mut w))
+             (world/apply-layout! (mut w) (mut head))
+             (let [old-count (al/al-len (load (field w registry)))]
+               (assert-eq (r/SaveFileText probe
+                                          c"(module demo.order) (defstruct StagedProbe [(id i64)])")
+                          (cast u8 1))
+               (assert-eq (live/start-prepared! first (mut w) (mut head) false)
+                          0)
+               (assert-eq (live/join! first) 0)
+               (assert-eq (load (field first errors)) 0)
+               (assert (load (field first changed)))
+               ;; Publication includes the immutable graph; the UI must not
+               ;; resolve names or allocate adjacency after adopting this job.
+               (assert-eq (al/al-len (load (field (field (field first snapshot)
+                                                         impact)
+                                                  heads)))
+                          (al/al-len (load (field (field first snapshot)
+                                                  entities))))
+               (assert (> (al/al-len (load (field (field (field first snapshot)
+                                                         impact)
+                                                  links)))
+                          0))
+               (assert (load (field first geometry-ready)))
+               (assert (> (al/al-len (load (field first vertices))) 0))
+               (assert (> (al/al-len (load (field first water-vertices))) 0))
+               (assert-eq (al/al-len (load (field w registry))) old-count)
+               (assert-eq (al/al-len (load (field (field first layout) registry)))
+                          (+ old-count 1))
+               (world/adopt-layout! (mut w) (field first layout))
+               (live/release-geometry! first)
+               (assert (not (load (field first geometry-ready))))
+               (assert-eq (al/al-len (load (field w registry))) (+ old-count 1))
+               (assert-eq (live/start-prepared! second
+                                                (mut w)
+                                                (field first snapshot)
+                                                false)
+                          0)
+               (assert-eq (live/join! second) 0)
+               (assert-eq (load (field second errors)) 0)
+               (assert (not (load (field second changed))))
+               (assert-eq (al/al-len (load (field (field (field second snapshot)
+                                                         impact)
+                                                  heads)))
+                          0)
+               (assert (not (load (field second geometry-ready))))
+               (live/close! first)
+               (live/close! second)
+               (let [saved (al/al-get (load (field w registry)) old-count)]
+                 (assert (str/str-eq (load (field saved name)) "StagedProbe"))))
+             (git/git_repository_free repo))
+           (scratch/scratch-close! (mut arena)))
+         (git/git_libgit2_shutdown))
+
+(deftest git-and-working-tree-identities-agree
+         (git/git_libgit2_init)
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 directory (mkdtemp (str/str->cstr a "build/atlas-test-XXXXXX"))
+                 _ (assert (!= (cast i64 directory) 0))
+                 created (demo/ensure-at! a (str/cstr->str directory))
+                 checked (assert-eq created 0)
+                 repo (git/open directory)
+                 revisions (git/history a repo 24)
+                 (mut head)
+                   (git/snapshot a
+                                 repo
+                                 (al/al-get revisions
+                                            (- (al/al-len revisions) 1)))
+                 job (live/new-job a repo)]
+             (assert-eq (live/start! job) 0)
+             (assert-eq (live/join! job) 0)
+             (assert-eq (load (field job errors)) 0)
+             (assert (> (al/al-len (load (field (field job snapshot) entities)))
+                        150))
+             (assert (world/same-snapshot? (mut head) (field job snapshot)))
+             (let [probe
+                     (str/str->cstr a
+                                    (git/concat a
+                                                (str/cstr->str directory)
+                                                "/order/probe.coil"))
+                   id
+                     (^ (str/str-hash "order/probe.coil")
+                        (* (str/str-hash "AgentProbe") 31))
+                   deleted (live/new-job a repo)]
+               (assert-eq (r/SaveFileText probe
+                                          c"(module demo.order) (defstruct AgentProbe [(id i64)])")
+                          (cast u8 1))
+               (assert-eq (live/start! job) 0)
+               (assert-eq (live/join! job) 0)
+               (world/reconcile! (mut head) (field job snapshot))
+               (let [at
+                       (world/find-entity (load (field (field job snapshot)
+                                                       entities))
+                                          id)]
+                 (assert (>= at 0))
+                 (let [entity
+                         (al/al-get (load (field (field job snapshot) entities))
+                                    at)]
+                   (assert-eq (load (field entity state)) 2)))
+               (assert-eq (unlink probe) (cast i32 0))
+               (assert-eq (live/start! deleted) 0)
+               (assert-eq (live/join! deleted) 0)
+               (world/reconcile! (field job snapshot) (field deleted snapshot))
+               (let [at
+                       (world/find-entity (load (field (field deleted snapshot)
+                                                       entities))
+                                          id)]
+                 (assert (>= at 0))
+                 (let [entity
+                         (al/al-get (load (field (field deleted snapshot)
+                                                 entities))
+                                    at)]
+                   (assert-eq (load (field entity state)) 3)))
+               (live/close! deleted))
+             (live/close! job)
+             (git/git_repository_free repo))
+           (scratch/scratch-close! (mut arena)))
+         (git/git_libgit2_shutdown))

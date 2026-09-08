@@ -1,0 +1,80 @@
+(module atlas.tests.spatial)
+(import "atlas.spatial" :as spatial)
+(import "atlas.ray" :as r)
+(import "atlas.landform" :as land)
+(import "atlas.terrain" :as terrain)
+(import "atlas.model" :as m)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(deftest spatial-nearest-matches-linear-with-duplicates-and-bounds
+         (let [(mut sites) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+               (mut i) 0]
+           (assert (< (r/fabs (- (spatial/nearest-squared (load sites)
+                                                          (r/v3 0.0 0.0 0.0)
+                                                          5.29)
+                                 5.29))
+                      0.000001))
+           (loop (if (>= (load i) 1000) (break 0) 0)
+             (let [n (cast f64 (% (load i) 137))]
+               (al/al-push! (mut sites)
+                            (r/v3 (+ -40.0 (* 30.0 (r/sin (* n 7.1))))
+                                  2.0
+                                  (+ 70.0 (* 30.0 (r/cos (* n 11.3)))))))
+             (store! i (+ (load i) 1)))
+           (let [(mut indexed)
+                   (spatial/build (load sites) (alloc/malloc-allocator))]
+             (store! i 0)
+             (loop (if (>= (load i) 300) (break 0) 0)
+               (let [n (cast f64 (load i))
+                     p
+                       (r/v3 (+ -40.0 (* 60.0 (r/sin (* n 3.7))))
+                             0.0
+                             (+ 70.0 (* 60.0 (r/cos (* n 5.3)))))
+                     linear (land/site-clearance p (load sites))
+                     actual (spatial/nearest-squared (load indexed) p 100000.0)
+                     bounded (spatial/nearest-squared (load indexed) p 5.29)
+                     expected
+                       (if (< (* linear linear) 5.29) (* linear linear) 5.29)]
+                 (assert (< (r/fabs (- actual (* linear linear))) 0.000001))
+                 (assert (< (r/fabs (- bounded expected)) 0.000001)))
+               (store! i (+ (load i) 1)))
+             (let [first (al/al-get (load sites) 0)]
+               (assert (< (r/distance2 first (r/v3 -40.0 2.0 100.0)) 0.000001)))
+             (al/al-free! (mut indexed)))
+           (al/al-free! (mut sites))))
+
+(deftest indexed-foundations-preserve-terrain-heights
+         (let [(mut sites) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+               island
+                 (m/Island
+                   :name "sites"
+                   :seed 83
+                   :position (r/v3 12.0 0.0 -8.0)
+                   :radius 10.0
+                   :count 2
+                   :changed 0)
+               (mut i) 0]
+           (al/al-push! (mut sites) (r/v3 12.0 2.0 -8.0))
+           (al/al-push! (mut sites) (r/v3 16.0 2.0 -7.0))
+           (let [(mut indexed)
+                   (spatial/build (load sites) (alloc/malloc-allocator))]
+             (loop (if (>= (load i) 1024) (break 0) 0)
+               (let [angle (* (cast f64 (% (load i) 64)) 0.098174770424681)
+                     scale
+                       (* (land/plateau-scale)
+                          (/ (cast f64 (/ (load i) 64)) 15.0))
+                     before
+                       (terrain/plateau-point island angle scale (load sites))
+                     after
+                       (terrain/indexed-plateau-point island
+                                                      angle
+                                                      scale
+                                                      (load indexed))]
+                 (assert (< (r/distance2 before after) 0.000001))
+                 (assert (< (r/fabs (- (cast f64 (load (field before y)))
+                                       (cast f64 (load (field after y)))))
+                            0.000001)))
+               (store! i (+ (load i) 1)))
+             (al/al-free! (mut indexed)))
+           (al/al-free! (mut sites))))

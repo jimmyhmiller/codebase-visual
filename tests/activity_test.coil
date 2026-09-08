@@ -1,0 +1,74 @@
+(module atlas.tests.activity)
+(import "atlas.view" :as view)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+
+(deftest activity-motion-is-a-function-of-simulation-time
+         (let [(mut v) (zeroed view/View)]
+           (store! (field v activity-origin) (r/v3 -8.0 3.6 4.0))
+           (store! (field v activity-target) (r/v3 12.0 2.0 -6.0))
+           (store! (field v age) 0.0)
+           (assert (< (r/distance2 (view/activity-position (mut v))
+                                   (load (field v activity-origin)))
+                      0.000001))
+           (store! (field v age) 0.2)
+           (let [once (view/activity-position (mut v))
+                 (mut i) 0]
+             (assert (< (r/fabs (- (cast f64 (load (field once x)))
+                                   (- 12.0 (* 20.0 (r/exp -1.0)))))
+                        0.00001))
+             ;; Repeated renders while paused must not advance the marker.
+             (loop (if (>= (load i) 120) (break 0) 0)
+               (store! (field v activity) (view/activity-position (mut v)))
+               (assert (< (r/distance2 once (load (field v activity))) 0.000001))
+               (store! i (+ (load i) 1)))
+             ;; Subdividing the elapsed simulation time gives the same endpoint.
+             (store! i 0)
+             (loop (if (> (load i) 20) (break 0) 0)
+               (store! (field v age) (* 0.01 (cast f64 (load i))))
+               (store! (field v activity) (view/activity-position (mut v)))
+               (store! i (+ (load i) 1)))
+             (assert (< (r/distance2 once (load (field v activity))) 0.000001)))))
+
+(deftest activity-only-represents-a-change-in-the-current-snapshot
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut snapshot) (m/new-snapshot a)
+                 (mut empty) (m/new-snapshot a)
+                 (mut v) (zeroed view/View)]
+             (assert (not (view/activity-visible? (mut v))))
+             (m/emit! (mut snapshot) "test.coil" "Unchanged" 0 1 1 1)
+             (m/emit! (mut snapshot) "test.coil" "Changed" 0 1 1 2)
+             (view/begin-change! (mut v) (mut snapshot))
+             (assert (not (view/activity-visible? (mut v))))
+             (let [changed (al/al-elem [m/Entity] (field snapshot entities) 1)
+                   position (r/v3 8.0 2.0 -9.0)
+                   (mut state) 1]
+               (store! (field changed position) position)
+               ;; Modified, added, and removed structures all represent observations.
+               (loop (if (> (load state) 3) (break 0) 0)
+                 (store! (field changed state) (load state))
+                 (view/begin-change! (mut v) (mut snapshot))
+                 (assert (view/activity-visible? (mut v)))
+                 (assert (< (r/distance2 position
+                                         (load (field v activity-target)))
+                            0.000001))
+                 (store! (field v age) 3.999)
+                 (assert (view/activity-visible? (mut v)))
+                 (store! (field v age) 4.0)
+                 (assert (not (view/activity-visible? (mut v))))
+                 ;; A later unchanged snapshot must not reuse the former target.
+                 (store! (field changed state) 0)
+                 (view/begin-change! (mut v) (mut snapshot))
+                 (assert (not (view/activity-visible? (mut v))))
+                 (store! (field changed state) (load state))
+                 (view/begin-change! (mut v) (mut snapshot))
+                 (assert (view/activity-visible? (mut v)))
+                 (view/begin-change! (mut v) (mut empty))
+                 (assert (not (view/activity-visible? (mut v))))
+                 (store! state (+ (load state) 1)))))
+           (scratch/scratch-close! (mut arena))))

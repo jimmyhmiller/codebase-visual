@@ -1,0 +1,109 @@
+(module atlas.tests.rock-mesh)
+(import "atlas.terrain" :as terrain)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(deftest outcrop-groups-stay-on-terraces-and-bound-rock-size
+         (let [(mut seed) 0]
+           (loop (if (>= (load seed) 24) (break 0) 0)
+             (let [(mut i) 0
+                   (mut low) 2.0
+                   (mut high) 0.0]
+               (loop (if (>= (load i) 36) (break 0) 0)
+                 (let [s (* (cast f64 (load seed)) 0.31)
+                       a (terrain/outcrop-site s 10.0 (load i))
+                       b (terrain/outcrop-site s 100.0 (load i))
+                       scale (load (field a scale))]
+                   (assert (>= scale 0.955))
+                   (assert (<= scale 1.110001))
+                   (assert (> (load (field a radius)) 0.0))
+                   (assert (<= (load (field a radius)) 0.650001))
+                   (assert (<= (load (field b radius)) 1.100001))
+                   (assert (< (r/fabs (- (load (field a angle))
+                                         (load (field b angle))))
+                              0.000001))
+                   (assert (< (r/fabs (- scale (load (field b scale))))
+                              0.000001))
+                   (assert (>= (load (field a height)) 0.30))
+                   (assert (<= (load (field a height)) 1.150001))
+                   (if (< scale (load low)) (store! low scale) 0)
+                   (if (> scale (load high)) (store! high scale) 0))
+                 (store! i (+ (load i) 1)))
+               (assert (> (- (load high) (load low)) 0.10)))
+             (store! seed (+ (load seed) 1)))))
+
+(defn same-point [(a r/Vector3) (b r/Vector3)] (-> bool)
+  (and (< (r/distance2 a b) 0.0000000001)
+       (< (r/fabs (- (cast f64 (load (field a y)))
+                     (cast f64 (load (field b y)))))
+          0.000001)))
+
+(deftest offshore-rocks-cross-the-waterline
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 40) (break 0) 0)
+             (let [height (+ 0.25 (* 0.13 (cast f64 (% (load i) 5))))
+                   seed (* (cast f64 (load i)) 0.7)
+                   p (terrain/offshore-anchor (r/v3 12.0 5.0 -8.0) height -0.48)
+                   (mut side) 0]
+               (assert (< (r/distance2 p (r/v3 12.0 0.0 -8.0)) 0.000001))
+               (loop (if (>= (load side) 8) (break 0) 0)
+                 (let [base (terrain/rock-point p 0.4 height seed 0 (load side))
+                       crown
+                         (terrain/rock-point p 0.4 height seed 3 (load side))]
+                   (assert (< (cast f64 (load (field base y))) -0.52))
+                   (assert (> (cast f64 (load (field crown y))) -0.34)))
+                 (store! side (+ (load side) 1))))
+             (store! i (+ (load i) 1)))))
+
+(deftest fractured-rock-preserves-clearance-and-closed-topology
+         (let [(mut seed) 0]
+           (loop (if (>= (load seed) 32) (break 0) 0)
+             (let [p (r/v3 10.0 2.0 -20.0)
+                   s (* (cast f64 (load seed)) 0.31)
+                   (mut vs)
+                     (al/al-new [terrain/Vertex] (alloc/malloc-allocator))
+                   (mut i) 0]
+               (terrain/rock! (mut vs) p 1.0 0.7 s)
+               (assert (= (al/al-len (load vs)) 192))
+               (loop (if (>= (load i) (al/al-len (load vs))) (break 0) 0)
+                 (let [v (al/al-get (load vs) (load i))
+                       q (load (field v p))]
+                   (assert (< (r/distance2 p q) 1.00001))
+                   (assert (> (cast f64 (load (field q y))) 1.91999))
+                   (assert (< (cast f64 (load (field q y))) 2.70001)))
+                 (store! i (+ (load i) 1)))
+               ;; Every oriented triangle edge has exactly one reverse edge.
+               ;; This checks the shared shoulders, crown fan and embedded bottom cap.
+               (store! i 0)
+               (loop (if (>= (load i) 192) (break 0) 0)
+                 (let [va (al/al-get (load vs) (load i))
+                       vb
+                         (al/al-get (load vs)
+                                    (+ (- (load i) (% (load i) 3))
+                                       (% (+ (load i) 1) 3)))
+                       a (load (field va p))
+                       b (load (field vb p))
+                       (mut j) 0
+                       (mut matches) 0]
+                   (assert (not (same-point a b)))
+                   (loop (if (>= (load j) 192) (break 0) 0)
+                     (let [vc (al/al-get (load vs) (load j))
+                           vd
+                             (al/al-get (load vs)
+                                        (+ (- (load j) (% (load j) 3))
+                                           (% (+ (load j) 1) 3)))]
+                       (if (and (same-point a (load (field vd p)))
+                                (same-point b (load (field vc p))))
+                           (store! matches (+ (load matches) 1))
+                           0))
+                     (store! j (+ (load j) 1)))
+                   (assert (= (load matches) 1)))
+                 (store! i (+ (load i) 1)))
+               ;; Adjacent bands use identical boundary vertices; the ring closes.
+               (let [a (terrain/rock-point p 1.0 0.7 s 3 0)
+                     b (terrain/rock-point p 1.0 0.7 s 3 8)]
+                 (assert (< (r/distance2 a b) 0.000001))
+                 (assert (> (r/distance2 a p) 0.19)))
+               (al/al-free! (mut vs)))
+             (store! seed (+ (load seed) 1)))))

@@ -1,0 +1,149 @@
+(module atlas.landform)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+
+;;; These bounds are shared with layout, not duplicated renderer estimates.
+(defn coast-scale [] (-> f64)
+  1.13)
+
+(defn stratum-width [] (-> f64)
+  0.033)
+
+(defn cliff-width [] (-> f64)
+  (* (stratum-width) 0.72))
+
+(defn plateau-scale [] (-> f64)
+  (- (coast-scale) (* 7.0 (stratum-width))))
+
+(defn main-coast-bound [] (-> f64)
+  (* (coast-scale) 1.17))
+
+(defn required-radius [(distance f64)] (-> f64)
+  (/ (+ distance 1.05) (* (plateau-scale) 0.805)))
+
+;;; Keep the sizing proof and rendered shoreline tessellation in agreement.
+(defn coast-segments [(radius f64)] (-> i64)
+  (cast i64 (r/clamp (r/floor (* 24.0 radius)) 112.0 2048.0)))
+
+(defn plateau-inradius [(radius f64)] (-> f64)
+  (* radius
+     (* (* (plateau-scale) 0.805)
+        (r/cos (/ 6.283185307179586 (cast f64 (coast-segments 0.0)))))))
+
+;;; A foundation disk subtends a bounded angular interval. Bound the minimum
+;;; coast over that interval plus one maximum mesh segment on either side.
+;;; |d coast/d angle| < 8.6: broad/inlet shape derivative <=14.52,
+;;; saturation derivative <=0.17/0.3, fine erosion derivative <=0.358.
+;;; Subtracting this Lipschitz bound times half a sample interval covers the
+;;; unsampled coast. The polygon chord lies outside min(endpoint radii)*cos(gap).
+;;; Thus the complete disk fits the actual mesh, including concave inlets.
+(defn required-site-radius [(seed f64) (x f64) (z f64)] (-> f64)
+  (let [distance (r/sqrt (+ (* x x) (* z z)))
+        gap (/ 6.283185307179586 (cast f64 (coast-segments 0.0)))
+        (mut minimum) 1.17]
+    (if (> distance 1.05)
+        (let [angle (r/atan2 z x)
+              extent
+                (+ (r/atan2 1.05 (r/sqrt (- (* distance distance) 1.1025))) gap)
+              (mut i) 0]
+          (loop (if (> (load i) 64) (break 0) 0)
+            (let [at
+                    (+ (- angle extent)
+                       (* (* 2.0 extent) (/ (cast f64 (load i)) 64.0)))
+                  value (coast seed at (plateau-scale))]
+              (if (< value (load minimum)) (store! minimum value) 0))
+            (store! i (+ (load i) 1)))
+          (store! minimum
+                  (r/clamp (- (load minimum) (* 8.6 (/ extent 64.0)))
+                           0.805
+                           1.17)))
+        (store! minimum 0.805))
+    (/ (+ distance 1.05) (* (plateau-scale) (* (load minimum) (r/cos gap))))))
+
+;;; Seed-dependent elongation, asymmetric headlands and two localized inlets.
+;;; Broad headlands use high-contrast smooth saturation, while fine erosion is
+;;; added afterward. Keeping those scales separate prevents the large-scale
+;;; silhouette from suppressing erosion at the tips of headlands. The complete
+;;; profile stays within [0.805, 1.17], the shared placement envelope.
+(defn coast [(seed f64) (angle f64) (scale f64)] (-> f64)
+  (let [elongation (+ 0.25 (* 0.70 (* 0.5 (+ 1.0 (r/sin (* seed 1.7))))))
+        bay-a (* 0.5 (+ 1.0 (r/cos (- angle (* seed 1.3)))))
+        bay-b (* 0.5 (+ 1.0 (r/cos (- angle (+ 1.9 (* seed 2.7))))))
+        broad
+          (+ (* elongation (r/cos (+ (* angle 2.0) seed)))
+             (+ (* 0.25 (r/sin (- angle seed)))
+                (+ (* 0.60 (r/sin (+ (* angle 3.0) (* seed 0.7))))
+                   (+ (* 0.26 (r/cos (+ (* angle 7.0) (* seed 2.0))))
+                      (* 0.15 (r/sin (+ (* angle 13.0) seed)))))))
+        inlets (+ (* 0.80 (r/pow bay-a 8.0)) (* 0.40 (r/pow bay-b 18.0)))
+        fine
+          (+ (* 0.05 (r/sin (+ (* angle 23.0) (+ seed (* scale 11.0)))))
+             (* 0.033 (r/cos (+ (* angle 37.0) (+ seed (* scale 17.0))))))
+        shape (- broad inlets)]
+    (+ 0.9875
+       (+ (* 0.17 (/ shape (r/sqrt (+ 0.09 (* shape shape)))))
+          (* (/ 0.0125 0.083) fine)))))
+
+;;; The top and waterline remain fixed; intermediate beds bend coherently.
+(defn stratum-height [(seed f64) (angle f64) (height f64)] (-> f64)
+  (let [t (r/clamp (/ (+ height 0.38) 2.32) 0.0 1.0)]
+    (+ height
+       (* (r/sin (* t 3.141592653589793))
+          (+ (* 0.16 (r/sin (+ (* angle 5.0) (+ seed (* height 0.7)))))
+             (* 0.045 (r/sin (+ (* angle 17.0) seed))))))))
+
+;;; Inverse of the seven cliff/terrace profiles, used to seat loose rocks.
+(defn radial-height [(scale f64)] (-> f64)
+  (let [layer
+          (r/clamp (r/floor (/ (- (coast-scale) scale) (stratum-width)))
+                   0.0
+                   6.0)
+        outer (- (coast-scale) (* layer (stratum-width)))
+        rise (r/clamp (/ (- outer scale) (cliff-width)) 0.0 1.0)]
+    (if (< scale (plateau-scale))
+        1.94
+        (+ -0.38 (+ (* layer 0.34) (* rise 0.28))))))
+
+(defn site-clearance [(p r/Vector3) (sites (al/ArrayList r/Vector3))] (-> f64)
+  (let [(mut nearest) 100000.0
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len sites)) (break 0) 0)
+      (let [d (r/distance2 p (al/al-get sites (load i)))]
+        (if (< d (load nearest)) (store! nearest d) 0))
+      (store! i (+ (load i) 1)))
+    (r/sqrt (load nearest))))
+
+;;; Flatten a disk around each foundation, including a full mesh-cell margin.
+(defn foundation-mask [(p r/Vector3) (sites (al/ArrayList r/Vector3))] (-> f64)
+  (mask-from-clearance (site-clearance p sites)))
+
+(defn mask-from-clearance [(distance f64)] (-> f64)
+  (let [t (r/clamp (/ (- distance 1.55) 0.75) 0.0 1.0)]
+    (* t (* t (- 3.0 (* 2.0 t))))))
+
+(defn hash-cell [(seed f64) (x f64) (z f64)] (-> f64)
+  (let [v (* (r/sin (+ (* x 127.1) (+ (* z 311.7) seed))) 43758.5453)]
+    (- v (r/floor v))))
+
+(defn noise2 [(seed f64) (x f64) (z f64)] (-> f64)
+  (let [ix (r/floor x)
+        iz (r/floor z)
+        fx (- x ix)
+        fz (- z iz)
+        u (* fx (* fx (- 3.0 (* 2.0 fx))))
+        v (* fz (* fz (- 3.0 (* 2.0 fz))))]
+    (r/mix (r/mix (hash-cell seed ix iz) (hash-cell seed (+ ix 1.0) iz) u)
+           (r/mix (hash-cell seed ix (+ iz 1.0))
+                  (hash-cell seed (+ ix 1.0) (+ iz 1.0))
+                  u)
+           v)))
+
+(defn plateau-height [(seed f64) (x f64) (z f64) (scale f64) (mask f64)] (-> f64)
+  (let [edge (r/clamp (/ (- (plateau-scale) scale) 0.12) 0.0 1.0)
+        ridge
+          (r/pow (- 1.0
+                    (r/fabs (- (* 2.0 (noise2 seed (* x 0.6) (* z 0.6))) 1.0)))
+                 3.0)
+        broad (noise2 (+ seed 17.0) (* x 0.23) (* z 0.23))
+        detail (* 0.12 (- (noise2 seed (* x 2.7) (* z 2.7)) 0.5))]
+    (+ 1.94 (* mask (* edge (+ (* ridge (+ 0.22 (* broad 0.52))) detail))))))

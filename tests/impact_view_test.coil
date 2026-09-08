@@ -1,0 +1,41 @@
+(module atlas.tests.impact-view)
+(import "atlas.view" :as view)
+(import "atlas.impact" :as impact)
+(import "atlas.model" :as m)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+
+(deftest impact-markers-invalidate-with-snapshot-and-selection
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut v) (zeroed view/View)]
+             (store! (field v impact-distances)
+                     (al/al-new [i64] (alloc/malloc-allocator)))
+             (m/emit! (mut s) "mod/a.coil" "A" 0 1 1 1)
+             (m/emit! (mut s) "mod/b.coil" "B" 0 1 1 1)
+             (let [b (al/al-get (load (field s entities)) 1)]
+               (al/al-push! (mut (field s references))
+                            (m/Reference
+                              :source (load (field b id))
+                              :target "A"
+                              :module "mod")))
+             (impact/prepare! (mut s))
+             (view/begin-change! (mut v) (mut s))
+             (view/update-impact! (mut v) (mut s))
+             (assert-eq (al/al-get (load (field v impact-distances)) 1) 1)
+             (store! (field (al/al-elem [m/Entity] (field s entities) 1) state)
+                     3)
+             (impact/prepare! (mut s))
+             (view/begin-change! (mut v) (mut s))
+             (view/update-impact! (mut v) (mut s))
+             (assert-eq (al/al-get (load (field v impact-distances)) 1) -1)
+             (assert-eq (load (field (field v impact-summary) direct)) 0)
+             (store! (field v selected) -1)
+             (view/update-impact! (mut v) (mut s))
+             (assert-eq (al/al-len (load (field v impact-distances))) 0)
+             (assert (not (load (field (field v impact-summary) available))))
+             (al/al-free! (mut (field v impact-distances))))
+           (scratch/scratch-close! (mut arena))))

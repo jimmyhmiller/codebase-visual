@@ -1,0 +1,243 @@
+(module atlas.live)
+(import "atlas.impact" :as impact)
+(import "atlas.repository" :as git)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.ray" :as r)
+(import "atlas.world" :as world)
+(import "atlas.terrain" :as terrain)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.thread" :as thread)
+(import "coil.atomic" :as atomic)
+(import "coil.fs" :as fs)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-len subslice])
+
+(cimport "unistd.h" :use [readlink])
+
+;;; Two jobs alternate ownership. Only the worker touches a running job; an
+;;; atomic completion publication and join transfer its immutable snapshot to UI.
+(defstruct Job
+  [(arena scratch/ScratchArena)
+   (snapshot m/Snapshot)
+   (repository (ptr git/git_repository))
+   (thread thread/Thread)
+   (done i64)
+   (joined bool)
+   (errors i64)
+   (registry (ptr analyzer/Registry))
+   (prepare bool)
+   (first bool)
+   (base (ptr world/World))
+   (previous (ptr m/Snapshot))
+   (layout world/World)
+   (changed bool)
+   (moved i64)
+   (geometry-ready bool)
+   (vertices (al/ArrayList terrain/ChunkData))
+   (water-vertices (al/ArrayList terrain/Vertex))
+   (geometry-ms f64)
+   (graph-ms f64)
+   (historical bool)
+   (revision m/Revision)
+   (revision-index i64)])
+
+(defn symlink? [(path (ptr i8))] (-> bool)
+  (let [(mut target) (zeroed (array i8 4096))]
+    (> (readlink path (index target 0) (cast u64 4096)) 0)))
+
+(defn scan! [(job (ptr Job)) (root (slice u8)) (relative (slice u8))] (-> i64)
+  (let [sink (field job snapshot)
+        a (load (field sink alc))
+        directory (git/concat a root relative)
+        normalized (subslice directory 0 (- (slice-len directory) 1))
+        files (r/LoadDirectoryFiles (str/str->cstr a normalized))
+        n (cast i64 (load (field files count)))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break 0) 0)
+      (let [full
+              (git/ctext a (load (index (load (field files paths)) (load i))))
+            path (subslice full (slice-len root) (slice-len full))
+            cpath (str/str->cstr a full)
+            (mut ignored) (cast i32 0)
+            status
+              (git/git_ignore_path_is_ignored (mut ignored)
+                                              (load (field job repository))
+                                              (str/str->cstr a path))]
+        (if (< status (cast i32 0))
+            (store! (field job errors) (+ (load (field job errors)) 1))
+            (if (and (= (load ignored) (cast i32 0))
+                     (not (str/str-eq path ".git")))
+                (cond (symlink? cpath) (al/al-push! (field sink paths) path)
+                      (!= (r/DirectoryExists cpath) (cast u8 0))
+                        (scan! job root (git/concat a path "/"))
+                      (>= (analyzer/lookup (load (field job registry)) path) 0)
+                        (do
+                          (al/al-push! (field sink paths) path)
+                          (match (fs/read-file a full)
+                            (Ok [source]
+                                (analyzer/analyze-registered! (load (field job
+                                                                           registry))
+                                                              sink
+                                                              path
+                                                              source))
+                            (Err [_]
+                                 (store! (field job errors)
+                                         (+ (load (field job errors)) 1)))))
+                      :else (al/al-push! (field sink paths) path))
+                0)))
+      (store! i (+ (load i) 1)))
+    (r/UnloadDirectoryFiles files)
+    0))
+
+(defn worker [(arg (ptr i8))] (-> (ptr i8))
+  (let [job (cast (ptr Job) arg)
+        a (scratch/scratch-allocator (field job arena))
+        root
+          (git/ctext a
+                     (git/git_repository_workdir (load (field job repository))))]
+    (store! (field job snapshot) (m/new-snapshot a))
+    (store! (field (field job snapshot) label)
+            "Live working tree / observing saved changes")
+    (store! (field (field job snapshot) revision) "WORKTREE")
+    (store! (field job errors) 0)
+    (if (load (field job historical))
+        (do
+          (store! (field job snapshot)
+                  (git/snapshot-with (load (field job registry))
+                                     a
+                                     (load (field job repository))
+                                     (load (field job revision))))
+          (store! (field job previous)
+                  (alloc/box! a
+                              m/Snapshot
+                              (git/parent-snapshot-with (load (field job
+                                                                     registry))
+                                                        a
+                                                        (load (field job
+                                                                     repository))
+                                                        (load (field job
+                                                                     revision)))))
+          0)
+        (if (> (slice-len root) 0)
+            (scan! job root "")
+            (store! (field job errors) 1)))
+    (if (and (load (field job prepare)) (= (load (field job errors)) 0))
+        (let [previous (load (field job previous))
+              next (field job snapshot)]
+          (if (or (load (field job first))
+                  (not (world/same-snapshot? previous next)))
+              (let [base (load (field job base))
+                    old-count (al/al-len (load (field base registry)))]
+                (world/reconcile! previous next)
+                (let [started (r/GetTime)]
+                  (impact/prepare! next)
+                  (store! (field job graph-ms)
+                          (* 1000.0 (- (r/GetTime) started))))
+                (store! (field job layout) (world/copy-layout base a))
+                (store! (field job moved)
+                        (world/register-live! (field job layout) next))
+                (store! (field job changed) true)
+                (world/prepare-routes! (field job layout) next)
+                (if (!= old-count
+                        (al/al-len (load (field (field job layout) registry))))
+                    (let [started (r/GetTime)]
+                      (store! (field job vertices)
+                              (terrain/generate-chunks (load (field (field job
+                                                                           layout)
+                                                                    islands))
+                                                       (load (field (field job
+                                                                           layout)
+                                                                    registry))))
+                      (store! (field job water-vertices)
+                              (terrain/generate-water (load (field (field job
+                                                                          layout)
+                                                                   islands))))
+                      (store! (field job geometry-ms)
+                              (* 1000.0 (- (r/GetTime) started)))
+                      (store! (field job geometry-ready) true))
+                    0))
+              0))
+        0)
+    (atomic/atomic-store (field job done) 1)
+    (cast (ptr i8) 0)))
+
+(defn new-job [(a (dyn alloc/Allocator)) (repo (ptr git/git_repository))] (-> (ptr Job))
+  (let [registry (alloc/box! a analyzer/Registry (analyzer/defaults a))]
+    (new-job-with a repo registry)))
+
+(defn new-job-with [(a (dyn alloc/Allocator))
+                    (repo (ptr git/git_repository))
+                    (registry (ptr analyzer/Registry))] (-> (ptr Job))
+  (let [job (alloc/box! a Job (zeroed Job))]
+    (scratch/scratch-init (field job arena) (alloc/malloc-allocator))
+    (store! (field job repository) repo)
+    (store! (field job registry) registry)
+    (store! (field job revision-index) -1)
+    job))
+
+(defn start! [(job (ptr Job))] (-> i64)
+  (store! (field job historical) false)
+  (store! (field job prepare) false)
+  (spawn! job))
+
+;;; base and previous remain immutable until join; the renderer may continue
+;;; updating the independent Island.changed counters, which copy-layout ignores.
+(defn start-prepared! [(job (ptr Job))
+                       (base (ptr world/World))
+                       (previous (ptr m/Snapshot))
+                       (first bool)] (-> i64)
+  (store! (field job historical) false)
+  (store! (field job prepare) true)
+  (store! (field job base) base)
+  (store! (field job previous) previous)
+  (store! (field job first) first)
+  (spawn! job))
+
+(defn start-revision! [(job (ptr Job))
+                       (base (ptr world/World))
+                       (revision m/Revision)
+                       (index i64)] (-> i64)
+  (store! (field job historical) true)
+  (store! (field job revision) revision)
+  (store! (field job revision-index) index)
+  (store! (field job prepare) true)
+  (store! (field job first) true)
+  (store! (field job base) base)
+  (spawn! job))
+
+(defn release-geometry! [(job (ptr Job))] (-> i64)
+  (if (load (field job geometry-ready))
+      (do
+        (terrain/release-chunks! (field job vertices))
+        (al/al-free! (field job water-vertices))
+        (store! (field job geometry-ready) false))
+      0)
+  0)
+
+(defn spawn! [(job (ptr Job))] (-> i64)
+  (release-geometry! job)
+  (scratch/scratch-reset! (field job arena))
+  (store! (field job changed) false)
+  (store! (field job moved) 0)
+  (store! (field job geometry-ms) 0.0)
+  (store! (field job graph-ms) 0.0)
+  (atomic/atomic-store (field job done) 0)
+  (store! (field job joined) false)
+  (cast i64
+        (thread/thread-spawn (field job thread)
+                             (fnptr-of worker)
+                             (cast (ptr i8) job))))
+
+(defn ready? [(job (ptr Job))] (-> bool)
+  (= (atomic/atomic-load (field job done)) 1))
+
+(defn join! [(job (ptr Job))] (-> i64)
+  (store! (field job joined) true)
+  (cast i64 (thread/thread-join (field job thread))))
+
+(defn close! [(job (ptr Job))] (-> i64)
+  (release-geometry! job)
+  (scratch/scratch-close! (field job arena)))

@@ -1,0 +1,1527 @@
+(module atlas.glyphs)
+(import "atlas.ray" :as r)
+(import "atlas.terrain" :as terrain)
+(import "atlas.model" :as m)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(defn vertex [(p r/Vector3)] (-> void)
+  (r/rlVertex3f (load (field p x)) (load (field p y)) (load (field p z))))
+
+;;; The raylib 5.5 immediate sphere supplies positions but no normals. Emit
+;;; radial normals explicitly so lighting is independent of the preceding draw.
+(defn sphere-normal [(latitude f64) (longitude f64)] (-> r/Vector3)
+  (r/v3 (* (r/cos latitude) (r/cos longitude))
+        (r/sin latitude)
+        (* (r/cos latitude) (r/sin longitude))))
+
+(defn sphere-vertex [(center r/Vector3) (radius f64) (n r/Vector3)] (-> i64)
+  (r/rlNormal3f (load (field n x)) (load (field n y)) (load (field n z)))
+  (vertex (r/v3 (+ (cast f64 (load (field center x)))
+                   (* radius (cast f64 (load (field n x)))))
+                (+ (cast f64 (load (field center y)))
+                   (* radius (cast f64 (load (field n y)))))
+                (+ (cast f64 (load (field center z)))
+                   (* radius (cast f64 (load (field n z)))))))
+  0)
+
+(defn sphere [(center r/Vector3)
+              (radius f64)
+              (rings i64)
+              (slices i64)
+              (color r/Color)] (-> i64)
+  (let [(mut ring) 0]
+    (r/rlBegin 4)
+    (r/rlColor4ub (load (field color r))
+                  (load (field color g))
+                  (load (field color b))
+                  (load (field color a)))
+    (loop (if (>= (load ring) (+ rings 1)) (break 0) 0)
+      (let [lo
+              (+ -1.5707963267948966
+                 (* 3.141592653589793
+                    (/ (cast f64 (load ring))
+                       (cast f64 (+ rings 1)))))
+            hi
+              (+ -1.5707963267948966
+                 (* 3.141592653589793
+                    (/ (cast f64 (+ (load ring) 1))
+                       (cast f64 (+ rings 1)))))
+            (mut slice) 0]
+        (loop (if (>= (load slice) slices) (break 0) 0)
+          (let [a
+                  (* 6.283185307179586
+                     (/ (cast f64 (load slice)) (cast f64 slices)))
+                b
+                  (* 6.283185307179586
+                     (/ (cast f64 (+ (load slice) 1)) (cast f64 slices)))
+                p (sphere-normal lo a)
+                q (sphere-normal hi a)
+                s (sphere-normal hi b)
+                t (sphere-normal lo b)]
+            ;; Omit degenerate pole triangles; the remaining fan closes each cap.
+            (if (> (load ring) 0)
+                (do
+                  (sphere-vertex center radius p)
+                  (sphere-vertex center radius q)
+                  (sphere-vertex center radius t)
+                  0)
+                0)
+            (if (< (load ring) rings)
+                (do
+                  (sphere-vertex center radius t)
+                  (sphere-vertex center radius q)
+                  (sphere-vertex center radius s)
+                  0)
+                0))
+          (store! slice (+ (load slice) 1))))
+      (store! ring (+ (load ring) 1)))
+    (r/rlEnd)
+    0))
+
+;;; Authored face normals give the narrow bevels real highlights, rather than
+;;; drawing white wireframes over every surface. Geometry remains batched.
+(defn surface! [(a r/Vector3) (b r/Vector3) (c r/Vector3) (color r/Color)] (-> i64)
+  (let [ux (- (cast f64 (load (field b x))) (cast f64 (load (field a x))))
+        uy (- (cast f64 (load (field b y))) (cast f64 (load (field a y))))
+        uz (- (cast f64 (load (field b z))) (cast f64 (load (field a z))))
+        vx (- (cast f64 (load (field c x))) (cast f64 (load (field a x))))
+        vy (- (cast f64 (load (field c y))) (cast f64 (load (field a y))))
+        vz (- (cast f64 (load (field c z))) (cast f64 (load (field a z))))
+        nx (- (* uy vz) (* uz vy))
+        ny (- (* uz vx) (* ux vz))
+        nz (- (* ux vy) (* uy vx))
+        length (r/sqrt (+ (* nx nx) (+ (* ny ny) (* nz nz))))]
+    (r/rlNormal3f (cast f32 (/ nx length))
+                  (cast f32 (/ ny length))
+                  (cast f32 (/ nz length)))
+    (r/rlColor4ub (load (field color r))
+                  (load (field color g))
+                  (load (field color b))
+                  (load (field color a)))
+    0))
+
+(defn triangle [(a r/Vector3) (b r/Vector3) (c r/Vector3) (color r/Color)] (-> i64)
+  (surface! a b c color)
+  (vertex a)
+  (vertex b)
+  (vertex c)
+  0)
+
+(defn quad [(a r/Vector3)
+            (b r/Vector3)
+            (c r/Vector3)
+            (d r/Vector3)
+            (color r/Color)] (-> i64)
+  (surface! a b c color)
+  (vertex a)
+  (vertex b)
+  (vertex c)
+  (vertex a)
+  (vertex c)
+  (vertex d)
+  0)
+
+;;; RL_QUADS supplies the two triangles through its shared index buffer.
+;;; Keep triangle-mode faces separate: the enum prism mixes triangles and quads.
+(defn indexed-quad [(a r/Vector3)
+                    (b r/Vector3)
+                    (c r/Vector3)
+                    (d r/Vector3)
+                    (color r/Color)] (-> i64)
+  (surface! a b c color)
+  (vertex a)
+  (vertex b)
+  (vertex c)
+  (vertex d)
+  0)
+
+;;; Four front vertices form two folded faces; the back shares a fixed
+;;; thickness. The crease gives each radial leaf a distinct lighting response.
+(defn fan-point [(p r/Vector3) (angle f64) (index i64)] (-> r/Vector3)
+  (let [side (% index 4)
+        back (if (>= index 4) 0.035 -0.035)
+        theta (+ angle (* (cast f64 (- side 1)) 0.15))
+        pivot (= side 0)]
+    (r/v3 (+ (cast f64 (load (field p x)))
+             (if pivot 0.0 (* 0.95 (r/sin theta))))
+          (+ (cast f64 (load (field p y)))
+             (if pivot 0.26 (+ 0.38 (* 1.42 (r/cos theta)))))
+          (+ (cast f64 (load (field p z)))
+             (+ back
+                (if pivot
+                    0.0
+                    (+ (* -0.20 (r/cos theta)) (if (= side 2) 0.14 0.0))))))))
+
+(defn fan-leaf [(x f64) (y f64) (z f64) (angle f64) (color r/Color) (wire bool)] (-> i64)
+  (let [p (r/v3 x y z)
+        a (fan-point p angle 0)
+        b (fan-point p angle 1)
+        c (fan-point p angle 2)
+        d (fan-point p angle 3)
+        e (fan-point p angle 4)
+        f (fan-point p angle 5)
+        g (fan-point p angle 6)
+        h (fan-point p angle 7)]
+    (if wire
+        (do
+          (r/DrawLine3D a b color)
+          (r/DrawLine3D b c color)
+          (r/DrawLine3D c d color)
+          (r/DrawLine3D d a color)
+          (r/DrawLine3D a c color)
+          (r/DrawLine3D e f color)
+          (r/DrawLine3D f g color)
+          (r/DrawLine3D g h color)
+          (r/DrawLine3D h e color)
+          (r/DrawLine3D e g color)
+          (r/DrawLine3D a e color)
+          (r/DrawLine3D b f color)
+          (r/DrawLine3D c g color)
+          (r/DrawLine3D d h color)
+          0)
+        (do
+          (r/rlBegin 4)
+          (triangle a b c color)
+          (triangle a c d (r/shade color 0.87))
+          (triangle e g f color)
+          (triangle e h g (r/shade color 0.87))
+          (quad a e f b (r/shade color 0.78))
+          (quad b f g c (r/shade color 1.25))
+          (quad c g h d (r/shade color 1.25))
+          (quad d h e a (r/shade color 1.1))
+          (r/rlEnd)
+          0))))
+
+(defn indexed-quad-into [(a r/Vector3)
+                         (b r/Vector3)
+                         (c r/Vector3)
+                         (d r/Vector3)
+                         (color r/Color)
+                         (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (if (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+      (indexed-quad a b c d color)
+      (let [n
+              (vector-unit (vector-cross (vector-add b (vector-scale a -1.0))
+                                         (vector-add c (vector-scale a -1.0))))]
+        (terrain/append-normal! sink a n color)
+        (terrain/append-normal! sink b n color)
+        (terrain/append-normal! sink c n color)
+        (terrain/append-normal! sink a n color)
+        (terrain/append-normal! sink c n color)
+        (terrain/append-normal! sink d n color))))
+
+(defn box-bevel [(w f64) (h f64) (d f64)] (-> f64)
+  (r/clamp (r/clamp (* h 0.23) 0.009 (* 0.12 (if (< w d) w d)))
+           0.0
+           (* h 0.49)))
+
+(defn box-into [(x f64)
+                (y f64)
+                (z f64)
+                (w f64)
+                (h f64)
+                (d f64)
+                (c r/Color)
+                (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [(mut points) (zeroed (array r/Vector3 16))
+        (mut ring) 0
+        bevel (box-bevel w h d)]
+    (loop (if (>= (load ring) 4) (break 0) 0)
+      (let [inside (or (= (load ring) 0) (= (load ring) 3))
+            wx (- (* w 0.5) (if inside bevel 0.0))
+            dz (- (* d 0.5) (if inside bevel 0.0))
+            yy
+              (+ y
+                 (cond (= (load ring) 0) (* h 0.5)
+                       (= (load ring) 1) (- (* h 0.5) bevel)
+                       (= (load ring) 2) (+ (* h -0.5) bevel)
+                       :else (* h -0.5)))
+            base (* (load ring) 4)]
+        (store! (index points base) (r/v3 (- x wx) yy (- z dz)))
+        (store! (index points (+ base 1)) (r/v3 (- x wx) yy (+ z dz)))
+        (store! (index points (+ base 2)) (r/v3 (+ x wx) yy (+ z dz)))
+        (store! (index points (+ base 3)) (r/v3 (+ x wx) yy (- z dz))))
+      (store! ring (+ (load ring) 1)))
+    (if (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+        (do (r/rlBegin 7) 0)
+        0)
+    (indexed-quad-into (load (index points 0))
+                       (load (index points 1))
+                       (load (index points 2))
+                       (load (index points 3))
+                       c
+                       sink)
+    (indexed-quad-into (load (index points 15))
+                       (load (index points 14))
+                       (load (index points 13))
+                       (load (index points 12))
+                       c
+                       sink)
+    (store! ring 0)
+    (loop (if (>= (load ring) 3) (break 0) 0)
+      (let [(mut side) 0
+            base (* (load ring) 4)
+            next (+ base 4)]
+        (loop (if (>= (load side) 4) (break 0) 0)
+          (let [i (load side)
+                j (% (+ i 1) 4)]
+            (indexed-quad-into (load (index points (+ base i)))
+                               (load (index points (+ next i)))
+                               (load (index points (+ next j)))
+                               (load (index points (+ base j)))
+                               (r/shade c (if (= (load ring) 1) 0.9 1.08))
+                               sink))
+          (store! side (+ (load side) 1))))
+      (store! ring (+ (load ring) 1)))
+    (if (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+        (do (r/rlEnd) 0)
+        0)
+    0))
+
+(defn box [(x f64) (y f64) (z f64) (w f64) (h f64) (d f64) (c r/Color)] (-> i64)
+  (box-into x y z w h d c (cast (ptr (al/ArrayList terrain/Vertex)) 0)))
+
+;;; Cool blue is reserved for potential lexical impact, never an edit state.
+;;; Width is supplied in world units from viewport scale; the radius is fixed.
+(defn dependent-point [(p r/Vector3) (angle f64) (radius f64)] (-> r/Vector3)
+  (r/v3 (+ (cast f64 (load (field p x))) (* radius (r/cos angle)))
+        2.065
+        (+ (cast f64 (load (field p z))) (* radius (r/sin angle)))))
+
+(defn dependent-ring [(p r/Vector3) (distance i64) (width f64)] (-> i64)
+  (let [(mut i) 0
+        color (r/rgba 136 184 235 (if (= distance 1) 220 150))]
+    (loop (if (>= (load i) 64) (break 0) 0)
+      (if (or (= distance 1) (< (% (load i) 8) 4))
+          (let [a (* (cast f64 (load i)) 0.09817477042468103)
+                b (* (cast f64 (+ (load i) 1)) 0.09817477042468103)
+                outer-a (dependent-point p a 1.14)
+                outer-b (dependent-point p b 1.14)
+                inner-a (dependent-point p a (- 1.14 width))
+                inner-b (dependent-point p b (- 1.14 width))]
+            (r/DrawTriangle3D outer-a inner-a inner-b color)
+            (r/DrawTriangle3D outer-a inner-b outer-b color)
+            0)
+          0)
+      (store! i (+ (load i) 1))))
+  0)
+
+(defn ring [(p r/Vector3) (radius f64) (c r/Color)] (-> i64)
+  (let [(mut i) 0
+        x (cast f64 (load (field p x)))
+        z (cast f64 (load (field p z)))
+        y (cast f64 (load (field p y)))]
+    (loop (if (>= (load i) 64) (break 0) 0)
+      (let [a (* (cast f64 (load i)) 0.0981747704)
+            b (+ a 0.0981747704)]
+        (r/DrawLine3D (r/v3 (+ x (* radius (r/cos a)))
+                            y
+                            (+ z (* radius (r/sin a))))
+                      (r/v3 (+ x (* radius (r/cos b)))
+                            y
+                            (+ z (* radius (r/sin b))))
+                      c))
+      (store! i (+ (load i) 1)))
+    0))
+
+(defn block-shape [(x f64)
+                   (y f64)
+                   (z f64)
+                   (w f64)
+                   (h f64)
+                   (d f64)
+                   (c r/Color)
+                   (wire bool)] (-> i64)
+  (if wire
+      (do
+        (r/DrawCubeWires (r/v3 x y z) (cast f32 w) (cast f32 h) (cast f32 d) c)
+        0)
+      (box x y z w h d c)))
+
+(defn branch-radius [(depth i64)] (-> f64)
+  (* 0.0075 (r/pow 1.43 (cast f64 depth))))
+
+(defn vector-add [(a r/Vector3) (b r/Vector3)] (-> r/Vector3)
+  (r/v3 (+ (cast f64 (load (field a x))) (cast f64 (load (field b x))))
+        (+ (cast f64 (load (field a y))) (cast f64 (load (field b y))))
+        (+ (cast f64 (load (field a z))) (cast f64 (load (field b z))))))
+
+(defn vector-scale [(a r/Vector3) (s f64)] (-> r/Vector3)
+  (r/v3 (* (cast f64 (load (field a x))) s)
+        (* (cast f64 (load (field a y))) s)
+        (* (cast f64 (load (field a z))) s)))
+
+(defn vector-dot [(a r/Vector3) (b r/Vector3)] (-> f64)
+  (+ (* (cast f64 (load (field a x))) (cast f64 (load (field b x))))
+     (+ (* (cast f64 (load (field a y))) (cast f64 (load (field b y))))
+        (* (cast f64 (load (field a z))) (cast f64 (load (field b z)))))))
+
+(defn vector-cross [(a r/Vector3) (b r/Vector3)] (-> r/Vector3)
+  (r/v3 (- (* (cast f64 (load (field a y))) (cast f64 (load (field b z))))
+           (* (cast f64 (load (field a z))) (cast f64 (load (field b y)))))
+        (- (* (cast f64 (load (field a z))) (cast f64 (load (field b x))))
+           (* (cast f64 (load (field a x))) (cast f64 (load (field b z)))))
+        (- (* (cast f64 (load (field a x))) (cast f64 (load (field b y))))
+           (* (cast f64 (load (field a y))) (cast f64 (load (field b x)))))))
+
+(defn vector-unit [(a r/Vector3)] (-> r/Vector3)
+  (let [length (r/sqrt (vector-dot a a))]
+    (if (> length 0.00000001)
+        (vector-scale a (/ 1.0 length))
+        (r/v3 0.0 0.0 0.0))))
+
+;;; Pick a nonparallel reference even for vertical or horizontal branches.
+(defn cylinder-tangent [(axis r/Vector3)] (-> r/Vector3)
+  (vector-unit (vector-cross axis
+                             (if (< (r/fabs (cast f64 (load (field axis y))))
+                                    0.9)
+                                 (r/v3 0.0 1.0 0.0)
+                                 (r/v3 1.0 0.0 0.0)))))
+
+(defn cylinder-normal [(radial r/Vector3)
+                       (axis r/Vector3)
+                       (length f64)
+                       (start-radius f64)
+                       (end-radius f64)] (-> r/Vector3)
+  (vector-unit (vector-add (vector-scale radial length)
+                           (vector-scale axis (- start-radius end-radius)))))
+
+(defn normal-vertex [(p r/Vector3)
+                     (n r/Vector3)
+                     (color r/Color)
+                     (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (if (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+      (do
+        (r/rlNormal3f (load (field n x)) (load (field n y)) (load (field n z)))
+        (vertex p)
+        0)
+      (terrain/append-normal! sink p n color)))
+
+;;; Closed tapered tube with smooth sides and separate hard cap normals.
+;;; Positions and normals are world-space in both color and shadow passes.
+(defn cylinder-into [(a r/Vector3)
+                     (b r/Vector3)
+                     (ra f64)
+                     (rb f64)
+                     (sides i64)
+                     (color r/Color)
+                     (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [delta (vector-add b (vector-scale a -1.0))
+        length (r/sqrt (vector-dot delta delta))]
+    (if (or (< length 0.00000001) (or (< sides 3) (or (< ra 0.0) (< rb 0.0))))
+        0
+        (let [axis (vector-scale delta (/ 1.0 length))
+              u (cylinder-tangent axis)
+              v (vector-cross axis u)
+              (mut i) 0]
+          (if (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+              (do
+                (r/rlBegin 4)
+                (r/rlColor4ub (load (field color r))
+                              (load (field color g))
+                              (load (field color b))
+                              (load (field color a)))
+                0)
+              0)
+          (loop (if (>= (load i) sides) (break 0) 0)
+            (let [angle
+                    (* 6.283185307179586
+                       (/ (cast f64 (load i)) (cast f64 sides)))
+                  next
+                    (* 6.283185307179586
+                       (/ (cast f64 (+ (load i) 1)) (cast f64 sides)))
+                  r0
+                    (vector-add (vector-scale u (r/cos angle))
+                                (vector-scale v (r/sin angle)))
+                  r1
+                    (vector-add (vector-scale u (r/cos next))
+                                (vector-scale v (r/sin next)))
+                  n0 (cylinder-normal r0 axis length ra rb)
+                  n1 (cylinder-normal r1 axis length ra rb)
+                  p (vector-add a (vector-scale r0 ra))
+                  q (vector-add a (vector-scale r1 ra))
+                  s (vector-add b (vector-scale r0 rb))
+                  t (vector-add b (vector-scale r1 rb))]
+              (if (> ra 0.0)
+                  (do
+                    (normal-vertex p n0 color sink)
+                    (normal-vertex q n1 color sink)
+                    (normal-vertex s n0 color sink)
+                    (normal-vertex a (vector-scale axis -1.0) color sink)
+                    (normal-vertex q (vector-scale axis -1.0) color sink)
+                    (normal-vertex p (vector-scale axis -1.0) color sink)
+                    0)
+                  0)
+              (if (> rb 0.0)
+                  (do
+                    (normal-vertex q n1 color sink)
+                    (normal-vertex t n1 color sink)
+                    (normal-vertex s n0 color sink)
+                    (normal-vertex b axis color sink)
+                    (normal-vertex s axis color sink)
+                    (normal-vertex t axis color sink)
+                    0)
+                  0))
+            (store! i (+ (load i) 1)))
+          (if (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+              (do (r/rlEnd) 0)
+              0)
+          0))))
+
+(defn cylinder [(a r/Vector3)
+                (b r/Vector3)
+                (ra f64)
+                (rb f64)
+                (sides i64)
+                (color r/Color)] (-> i64)
+  (cylinder-into a
+                 b
+                 ra
+                 rb
+                 sides
+                 color
+                 (cast (ptr (al/ArrayList terrain/Vertex)) 0)))
+
+(defn vertical-cylinder [(base r/Vector3)
+                         (top-radius f64)
+                         (bottom-radius f64)
+                         (height f64)
+                         (sides i64)
+                         (color r/Color)] (-> i64)
+  (cylinder base
+            (vector-add base (r/v3 0.0 height 0.0))
+            bottom-radius
+            top-radius
+            sides
+            color))
+
+(defn limb [(a r/Vector3)
+            (b r/Vector3)
+            (radius-a f64)
+            (radius-b f64)
+            (color r/Color)
+            (wire bool)
+            (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (if wire
+      (do (r/DrawLine3D a b color) 0)
+      (do
+        (cylinder-into a b radius-a radius-b 6 color sink)
+        0)))
+
+(defn branch [(p r/Vector3)
+              (angle f64)
+              (length f64)
+              (depth i64)
+              (c r/Color)
+              (wire bool)
+              (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (if (= depth 0)
+      0
+      (let [x (cast f64 (load (field p x)))
+            y (cast f64 (load (field p y)))
+            z (cast f64 (load (field p z)))
+            radius (branch-radius depth)
+            tip-radius (branch-radius (- depth 1))
+            bend (+ angle (* 0.32 (r/sin (+ angle (cast f64 depth)))))
+            joint
+              (r/v3 (+ x (* length (* 0.18 (r/cos bend))))
+                    (+ y (* length 0.46))
+                    (+ z (* length (* 0.18 (r/sin bend)))))
+            tip
+              (r/v3 (+ x (* length (* 0.5 (r/cos angle))))
+                    (+ y (* length 0.8))
+                    (+ z (* length (* 0.5 (r/sin angle)))))]
+        (limb p joint radius (r/mix radius tip-radius 0.45) c wire sink)
+        (limb joint tip (r/mix radius tip-radius 0.45) tip-radius c wire sink)
+        (branch tip
+                (+ angle (+ 0.72 (* 0.14 (r/sin angle))))
+                (* length 0.70)
+                (- depth 1)
+                c
+                wire
+                sink)
+        (branch tip
+                (- angle (+ 1.10 (* 0.18 (r/cos angle))))
+                (* length 0.62)
+                (- depth 1)
+                c
+                wire
+                sink))))
+
+;;; A continuous closed shell: foot, wall, projecting cornice, beveled rim,
+;;; dark inner walls and a recessed floor. One profile drives every render pass.
+(defn courtyard-point [(height f64) (ring i64) (corner i64)] (-> r/Vector3)
+  (let [half
+          (cond (= ring 0) 0.17
+                (or (= ring 1) (= ring 2)) 0.195
+                (or (= ring 3) (= ring 4)) 0.177
+                (or (= ring 5) (= ring 6)) 0.20
+                (= ring 7) 0.185
+                (= ring 8) 0.135
+                :else 0.145)
+        y
+          (cond (= ring 0) 0.03
+                (= ring 1) 0.06
+                (= ring 2) 0.13
+                (= ring 3) 0.15
+                (= ring 4) (- height 0.065)
+                (= ring 5) (- height 0.04)
+                (= ring 6) (- height 0.012)
+                (or (= ring 7) (= ring 8)) height
+                (= ring 9) (- height 0.035)
+                :else 0.14)]
+    (r/v3 (if (< corner 2) (- 0.0 half) half)
+          y
+          (if (or (= corner 0) (= corner 3)) (- 0.0 half) half))))
+
+(defn courtyard-tone [(ring i64)] (-> f64)
+  (cond (< ring 2) 0.62
+        (= ring 2) 1.05
+        (= ring 3) 0.82
+        (= ring 4) 0.68
+        (< ring 8) 1.15
+        (= ring 8) 0.82
+        :else 0.42))
+
+(defn courtyard-cell [(x f64)
+                      (y f64)
+                      (z f64)
+                      (height f64)
+                      (color r/Color)
+                      (wire bool)
+                      (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [origin (r/v3 x y z)
+        (mut course) 0]
+    (if (and (not wire) (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0)))
+        (do (r/rlBegin 7) 0)
+        0)
+    (loop (if (>= (load course) 11) (break 0) 0)
+      (let [(mut side) 0
+            tone
+              (if wire
+                  (load color)
+                  (r/shade color (courtyard-tone (load course))))]
+        (loop (if (>= (load side) 4) (break 0) 0)
+          (let [i (load side)
+                j (% (+ i 1) 4)
+                a (vector-add origin (courtyard-point height (load course) i))
+                b (vector-add origin (courtyard-point height (load course) j))]
+            (if wire (do (r/DrawLine3D a b tone) 0) 0)
+            (if (< (load course) 10)
+                (let [c
+                        (vector-add origin
+                                    (courtyard-point height
+                                                     (+ (load course) 1)
+                                                     j))
+                      d
+                        (vector-add origin
+                                    (courtyard-point height
+                                                     (+ (load course) 1)
+                                                     i))]
+                  (if wire
+                      (do (r/DrawLine3D a d tone) 0)
+                      (indexed-quad-into a b c d tone sink)))
+                0))
+          (store! side (+ (load side) 1))))
+      (store! course (+ (load course) 1)))
+    (if (not wire)
+        (do
+          (indexed-quad-into (vector-add origin (courtyard-point height 10 0))
+                             (vector-add origin (courtyard-point height 10 1))
+                             (vector-add origin (courtyard-point height 10 2))
+                             (vector-add origin (courtyard-point height 10 3))
+                             (r/shade color 0.32)
+                             sink)
+          (indexed-quad-into (vector-add origin (courtyard-point height 0 3))
+                             (vector-add origin (courtyard-point height 0 2))
+                             (vector-add origin (courtyard-point height 0 1))
+                             (vector-add origin (courtyard-point height 0 0))
+                             (r/shade color 0.45)
+                             sink))
+        0)
+    (if (and (not wire) (= sink (cast (ptr (al/ArrayList terrain/Vertex)) 0)))
+        (do (r/rlEnd) 0)
+        0)
+    0))
+
+(defn courtyard-body [(color r/Color)
+                      (wire bool)
+                      (origin r/Vector3)
+                      (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) 9) (break 0) 0)
+      (if (!= (load i) 4)
+          (courtyard-cell (+ (cast f64 (load (field origin x)))
+                             (* (cast f64 (- (% (load i) 3) 1)) 0.43))
+                          (cast f64 (load (field origin y)))
+                          (+ (cast f64 (load (field origin z)))
+                             (* (cast f64 (- (/ (load i) 3) 1)) 0.43))
+                          (+ 0.48 (* 0.09 (cast f64 (% (load i) 2))))
+                          color
+                          wire
+                          sink)
+          0)
+      (store! i (+ (load i) 1)))
+    0))
+
+(defn generate-courtyard [(palette i64)] (-> (al/ArrayList terrain/Vertex))
+  (let [(mut vertices) (al/al-new [terrain/Vertex] (alloc/malloc-allocator))]
+    (courtyard-body (glyph-color (if (= palette 4) 0 palette) (= palette 4))
+                    false
+                    (r/v3 0.0 1.99 0.0)
+                    (mut vertices))
+    (load vertices)))
+
+(defn bake-courtyards [] (-> (array r/Model 5))
+  (let [(mut models) (zeroed (array r/Model 5))
+        (mut i) 0]
+    (loop (if (>= (load i) 5) (break 0) 0)
+      (let [(mut vertices) (generate-courtyard (load i))]
+        (store! (index models (load i)) (terrain/upload (load vertices)))
+        (al/al-free! (mut vertices)))
+      (store! i (+ (load i) 1)))
+    (load models)))
+
+;;; Queue bays describe the glyph, not an invented runtime queue length.
+;;; Shared part geometry keeps solid, shadow and wireframe passes identical.
+(defstruct QueuePart [(center r/Vector3) (size r/Vector3) (tone f64)])
+
+;;; A function is a low service pavilion: an open entrance under a projecting
+;;; roof, with a ribbed roof panel. These are glyph details, not runtime state.
+(defstruct FunctionPart [(center r/Vector3) (size r/Vector3) (tone f64)])
+
+(defn function-part [(index i64)] (-> FunctionPart)
+  (cond (= index 0)
+          (FunctionPart
+            :center (r/v3 0.0 0.065 0.0)
+            :size (r/v3 0.96 0.06 1.0)
+            :tone 0.48)
+        (< index 3)
+          (FunctionPart
+            :center (r/v3 (if (= index 1) -0.37 0.37) 0.27 0.0)
+            :size (r/v3 0.14 0.35 0.88)
+            :tone 0.85)
+        (= index 3)
+          (FunctionPart
+            :center (r/v3 0.0 0.27 -0.39)
+            :size (r/v3 0.60 0.35 0.10)
+            :tone 0.72)
+        (= index 4)
+          (FunctionPart
+            :center (r/v3 0.0 0.485 0.0)
+            :size (r/v3 0.98 0.08 0.98)
+            :tone 1.10)
+        (= index 5)
+          (FunctionPart
+            :center (r/v3 0.0 0.545 0.0)
+            :size (r/v3 0.62 0.04 0.68)
+            :tone 0.68)
+        (< index 10)
+          (FunctionPart
+            :center
+              (r/v3 (+ -0.24 (* (cast f64 (- index 6)) 0.16))
+                    0.585
+                    0.0)
+            :size (r/v3 0.055 0.04 0.68)
+            :tone 1.12)
+        (= index 10)
+          (FunctionPart
+            :center (r/v3 0.0 0.075 0.54)
+            :size (r/v3 0.50 0.08 0.14)
+            :tone 0.82)
+        :else
+          (FunctionPart
+            :center (r/v3 0.24 0.675 -0.22)
+            :size (r/v3 0.14 0.14 0.20)
+            :tone 0.96)))
+
+(defn function-body [(origin r/Vector3)
+                     (color r/Color)
+                     (wire bool)
+                     (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) 12) (break 0) 0)
+      (let [part (function-part (load i))
+            p (vector-add origin (load (field part center)))
+            size (load (field part size))
+            c (r/shade color (load (field part tone)))
+            x (cast f64 (load (field p x)))
+            y (cast f64 (load (field p y)))
+            z (cast f64 (load (field p z)))
+            w (cast f64 (load (field size x)))
+            h (cast f64 (load (field size y)))
+            d (cast f64 (load (field size z)))]
+        (if wire
+            (block-shape x y z w h d c true)
+            (box-into x y z w h d c sink)))
+      (store! i (+ (load i) 1)))
+    0))
+
+(defn generate-function [(palette i64)] (-> (al/ArrayList terrain/Vertex))
+  (let [(mut vertices) (al/al-new [terrain/Vertex] (alloc/malloc-allocator))]
+    (function-body (r/v3 0.0 1.99 0.0)
+                   (glyph-color (if (= palette 4) 0 palette) (= palette 4))
+                   false
+                   (mut vertices))
+    (load vertices)))
+
+(defn bake-functions [] (-> (array r/Model 5))
+  (let [(mut models) (zeroed (array r/Model 5))
+        (mut i) 0]
+    (loop (if (>= (load i) 5) (break 0) 0)
+      (let [(mut vertices) (generate-function (load i))]
+        (store! (index models (load i)) (terrain/upload (load vertices)))
+        (al/al-free! (mut vertices)))
+      (store! i (+ (load i) 1)))
+    (load models)))
+
+(defn queue-part [(index i64)] (-> QueuePart)
+  (cond (= index 0)
+          (QueuePart
+            :center (r/v3 0.0 0.08 0.0)
+            :size (r/v3 0.40 0.16 1.32)
+            :tone 0.55)
+        (< index 3)
+          (QueuePart
+            :center (r/v3 (if (= index 1) -0.175 0.175) 0.30 0.0)
+            :size (r/v3 0.05 0.28 1.32)
+            :tone 1.0)
+        (= index 3)
+          (QueuePart
+            :center (r/v3 0.0 0.25 0.63)
+            :size (r/v3 0.30 0.18 0.06)
+            :tone 0.85)
+        (< index 7)
+          (QueuePart
+            :center (r/v3 0.0 0.205 (- (* (cast f64 (- index 4)) 0.36) 0.42))
+            :size (r/v3 0.25 0.09 0.19)
+            :tone 1.20)
+        :else
+          (QueuePart
+            :center
+              (r/v3 (if (< index 10) -0.2025 0.2025)
+                    0.25
+                    (- (* (cast f64 (% (- index 7) 3)) 0.53) 0.53))
+            :size (r/v3 0.035 0.38 0.075)
+            :tone 1.12)))
+
+(defn queue-channel [(x f64) (y f64) (z f64) (color r/Color) (wire bool)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) 13) (break 0) 0)
+      (let [part (queue-part (load i))
+            p (load (field part center))
+            size (load (field part size))]
+        (block-shape (+ x (cast f64 (load (field p x))))
+                     (+ y (cast f64 (load (field p y))))
+                     (+ z (cast f64 (load (field p z))))
+                     (cast f64 (load (field size x)))
+                     (cast f64 (load (field size y)))
+                     (cast f64 (load (field size z)))
+                     (r/shade color (load (field part tone)))
+                     wire))
+      (store! i (+ (load i) 1))))
+  0)
+
+;;; A recessed slab body carries a thin projecting cap. Both are actual
+;;; beveled solids, so the lip survives orbiting and casts a contact shadow.
+;;; Wire states retain the single outer construction envelope.
+(defn stacked-slab [(x f64)
+                    (y f64)
+                    (z f64)
+                    (color r/Color)
+                    (wire bool)
+                    (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (if wire
+      (block-shape x y z 1.16 0.105 0.95 color true)
+      (do
+        (box-into x (- y 0.0175) z 1.11 0.070 0.90 (r/shade color 0.66) sink)
+        (box-into x (+ y 0.035) z 1.16 0.035 0.95 (r/shade color 1.12) sink)
+        0)))
+
+;;; Complete field metadata gives a base plus one tier per field (3..11).
+;;; Unknown/partial metadata retains the token-size fallback, never a partial
+;;; field count. A site's height is independent of other entities or selection.
+(defn struct-levels [(entity m/Entity)] (-> i64)
+  (cast i64
+        (r/clamp (if (load (field entity details-known))
+                     (+ 2.0
+                        (cast f64 (al/al-len (load (field entity details)))))
+                     (+ 2.0
+                        (/ (r/sqrt (cast f64
+                                         (if (> (load (field entity members)) 0)
+                                             (load (field entity members))
+                                             0)))
+                           1.45)))
+                 3.0
+                 11.0)))
+
+;;; Source-order field cells in a bounded exploded lattice, not memory layout.
+;;; Every field has a cell; increasing count subdivides the same site envelope.
+(defn member-grid [(count i64)] (-> i64)
+  (let [(mut side) 1]
+    (loop (if (>= (* (load side) (* (load side) (load side))) count)
+              (break (load side))
+              0)
+      (store! side (+ (load side) 1)))))
+
+(defn member-bounds [(p r/Vector3) (count i64) (index i64)] (-> r/BoundingBox)
+  (let [side (member-grid count)
+        dx (/ 1.16 (cast f64 side))
+        dz (/ 1.0 (cast f64 side))
+        dy (/ 1.35 (cast f64 side))
+        x
+          (+ (cast f64 (load (field p x)))
+             (+ -0.58 (* (+ (cast f64 (% index side)) 0.5) dx)))
+        z
+          (+ (cast f64 (load (field p z)))
+             (+ -0.50 (* (+ (cast f64 (% (/ index side) side)) 0.5) dz)))
+        y (+ 2.12 (* (+ (cast f64 (/ index (* side side))) 0.5) dy))]
+    (r/BoundingBox :min
+                     (r/v3 (- x (* dx 0.39))
+                           (- y (* dy 0.39))
+                           (- z (* dz 0.39)))
+      :max (r/v3 (+ x (* dx 0.39)) (+ y (* dy 0.39)) (+ z (* dz 0.39))))))
+
+(defstruct MemberHit [(collision r/RayCollision) (index i64)])
+
+(defn member-hit [(ray r/Ray) (p r/Vector3) (count i64)] (-> MemberHit)
+  (let [x (cast f64 (load (field p x)))
+        z (cast f64 (load (field p z)))
+        (mut best)
+          (r/GetRayCollisionBox ray
+                                (r/BoundingBox :min
+                                                 (r/v3 (- x 0.69)
+                                                       1.975
+                                                       (- z 0.61))
+                                  :max (r/v3 (+ x 0.69) 2.035 (+ z 0.61))))
+        (mut selected) -1
+        (mut i) 0]
+    (loop (if (>= (load i) count) (break 0) 0)
+      (let [hit (r/GetRayCollisionBox ray (member-bounds p count (load i)))]
+        (if (and (!= (load (field hit hit)) (cast u8 0))
+                 (or (= (load (field best hit)) (cast u8 0))
+                     (< (load (field hit distance))
+                        (load (field best distance)))))
+            (do (store! best (load hit)) (store! selected (load i)))
+            0))
+      (store! i (+ (load i) 1)))
+    (MemberHit :collision (load best) :index (load selected))))
+
+(defn member-wire-mode! [(shader r/Shader) (value (ptr f32))] (-> i64)
+  (r/rlDrawRenderBatchActive)
+  (r/SetShaderValue shader
+                    (r/GetShaderLocation shader c"blueprint")
+                    (cast (ptr u8) value)
+                    0)
+  0)
+
+(defn member-body [(p r/Vector3)
+                   (entity m/Entity)
+                   (state i64)
+                   (selected i64)
+                   (wire bool)
+                   (shadow-pass bool)
+                   (shader r/Shader)] (-> i64)
+  (let [count (m/member-count entity)
+        x (cast f64 (load (field p x)))
+        z (cast f64 (load (field p z)))
+        color (glyph-color state false)
+        (mut i) 0]
+    (block-shape x
+                 2.005
+                 z
+                 1.38
+                 0.06
+                 1.22
+                 (if wire color (r/rgba 37 43 40 255))
+                 wire)
+    (loop (if (>= (load i) count) (break 0) 0)
+      (let [field-state (m/member-state entity (load i))
+            color (glyph-color (if (= field-state 4) 0 field-state) false)
+            bounds (member-bounds p count (load i))
+            low (load (field bounds min))
+            high (load (field bounds max))
+            cx
+              (* 0.5
+                 (+ (cast f64 (load (field low x)))
+                    (cast f64 (load (field high x)))))
+            cy
+              (* 0.5
+                 (+ (cast f64 (load (field low y)))
+                    (cast f64 (load (field high y)))))
+            cz
+              (* 0.5
+                 (+ (cast f64 (load (field low z)))
+                    (cast f64 (load (field high z)))))
+            width
+              (- (cast f64 (load (field high x)))
+                 (cast f64 (load (field low x))))
+            height
+              (- (cast f64 (load (field high y)))
+                 (cast f64 (load (field low y))))
+            depth
+              (- (cast f64 (load (field high z)))
+                 (cast f64 (load (field low z))))]
+        (if (and (= field-state 3) (not wire) (not shadow-pass))
+            (let [(mut enabled) (cast f32 1.0)]
+              (member-wire-mode! shader enabled))
+            0)
+        (if (and shadow-pass (= field-state 3))
+            0
+            (block-shape cx
+                         cy
+                         cz
+                         width
+                         height
+                         depth
+                         color
+                         (or wire (= field-state 3))))
+        (if (and (= field-state 3) (not wire) (not shadow-pass))
+            (let [(mut disabled) (cast f32 0.0)]
+              (member-wire-mode! shader disabled))
+            0)
+        (if (and (= (load i) selected) (not wire))
+            (let [rim (r/rgba 233 225 205 255)
+                  top (+ (cast f64 (load (field high y))) (* height 0.025))]
+              (block-shape (- cx (* width 0.45))
+                           top
+                           cz
+                           (* width 0.10)
+                           (* height 0.05)
+                           depth
+                           rim
+                           false)
+              (block-shape (+ cx (* width 0.45))
+                           top
+                           cz
+                           (* width 0.10)
+                           (* height 0.05)
+                           depth
+                           rim
+                           false)
+              (block-shape cx
+                           top
+                           (- cz (* depth 0.45))
+                           (* width 0.8)
+                           (* height 0.05)
+                           (* depth 0.10)
+                           rim
+                           false)
+              (block-shape cx
+                           top
+                           (+ cz (* depth 0.45))
+                           (* width 0.8)
+                           (* height 0.05)
+                           (* depth 0.10)
+                           rim
+                           false))
+            0))
+      (store! i (+ (load i) 1)))
+    0))
+
+;;; A gameplay selection envelope includes the slab stack and its foundation.
+;;; It intentionally includes recesses between slabs, not triangle-exact gaps.
+(defn struct-bounds [(p r/Vector3) (levels i64)] (-> r/BoundingBox)
+  (let [x (cast f64 (load (field p x)))
+        z (cast f64 (load (field p z)))
+        top (+ 1.99 (+ 0.2025 (* (cast f64 (- levels 1)) 0.24)))]
+    (r/BoundingBox :min (r/v3 (- x 0.69) 1.975 (- z 0.61))
+      :max (r/v3 (+ x 0.69) top (+ z 0.61)))))
+
+(defn include-point! [(bounds (ptr r/BoundingBox)) (p r/Vector3)] (-> i64)
+  (if (< (load (field p x)) (load (field (field bounds min) x)))
+      (store! (field (field bounds min) x) (load (field p x)))
+      0)
+  (if (> (load (field p x)) (load (field (field bounds max) x)))
+      (store! (field (field bounds max) x) (load (field p x)))
+      0)
+  (if (< (load (field p y)) (load (field (field bounds min) y)))
+      (store! (field (field bounds min) y) (load (field p y)))
+      0)
+  (if (> (load (field p y)) (load (field (field bounds max) y)))
+      (store! (field (field bounds max) y) (load (field p y)))
+      0)
+  (if (< (load (field p z)) (load (field (field bounds min) z)))
+      (store! (field (field bounds min) z) (load (field p z)))
+      0)
+  (if (> (load (field p z)) (load (field (field bounds max) z)))
+      (store! (field (field bounds max) z) (load (field p z)))
+      0)
+  0)
+
+(defn translated-bounds [(bounds r/BoundingBox) (p r/Vector3)] (-> r/BoundingBox)
+  (let [offset
+          (r/v3 (cast f64 (load (field p x))) 0.0 (cast f64 (load (field p z))))]
+    (r/BoundingBox :min (vector-add (load (field bounds min)) offset)
+      :max (vector-add (load (field bounds max)) offset))))
+
+;;; Cache whole-building envelopes once, including every tree variant. Empty
+;;; spaces within a building remain selectable; terrain occlusion is separate.
+(defn pick-bounds-cache [] (-> (array r/BoundingBox 24))
+  (let [(mut cache) (zeroed (array r/BoundingBox 24))
+        (mut kind) 0]
+    (loop (if (>= (load kind) 24) (break 0) 0)
+      (let [(mut bounds) (zeroed r/BoundingBox)
+            (mut i) 0]
+        (store! bounds
+                (r/BoundingBox :min (r/v3 -0.69 1.975 -0.61)
+                  :max (r/v3 0.69 2.035 0.61)))
+        (cond (= (load kind) 1)
+                (loop (if (>= (load i) 72) (break 0) 0)
+                  (include-point! (mut bounds)
+                                  (fan-point (r/v3 0.0 1.99 0.0)
+                                             (+ -1.55
+                                                (* (cast f64 (/ (load i) 8))
+                                                   0.35))
+                                             (% (load i) 8)))
+                  (store! i (+ (load i) 1)))
+              (= (load kind) 2)
+                (let [(mut vertices) (generate-courtyard 0)]
+                  (loop (if (>= (load i) (al/al-len (load vertices)))
+                            (break 0)
+                            0)
+                    (let [vertex (al/al-get (load vertices) (load i))]
+                      (include-point! (mut bounds) (load (field vertex p))))
+                    (store! i (+ (load i) 1)))
+                  (al/al-free! (mut vertices)))
+              (= (load kind) 4)
+                (loop (if (>= (load i) 39) (break 0) 0)
+                  (let [part (queue-part (% (load i) 13))
+                        center
+                          (vector-add (load (field part center))
+                                      (r/v3 (* (cast f64 (- (/ (load i) 13) 1))
+                                               0.46)
+                                            1.99
+                                            0.0))
+                        half (vector-scale (load (field part size)) 0.5)]
+                    (include-point! (mut bounds) (vector-add center half))
+                    (include-point! (mut bounds)
+                                    (vector-add center (vector-scale half -1.0))))
+                  (store! i (+ (load i) 1)))
+              (= (load kind) 5)
+                (loop (if (>= (load i) 6) (break 0) 0)
+                  (let [angle (* (cast f64 (load i)) 1.047197551)
+                        node
+                          (r/v3 (* 0.65 (r/cos angle))
+                                (+ 2.39 (* 0.3 (r/sin (* angle 2.0))))
+                                (* 0.65 (r/sin angle)))
+                        radius (r/v3 0.12 0.12 0.12)]
+                    (include-point! (mut bounds) (vector-add node radius))
+                    (include-point! (mut bounds)
+                                    (vector-add node (vector-scale radius -1.0))))
+                  (store! i (+ (load i) 1)))
+              (= (load kind) 6)
+                (let [(mut vertices) (generate-function 0)]
+                  (loop (if (>= (load i) (al/al-len (load vertices)))
+                            (break 0)
+                            0)
+                    (let [vertex (al/al-get (load vertices) (load i))]
+                      (include-point! (mut bounds) (load (field vertex p))))
+                    (store! i (+ (load i) 1)))
+                  (al/al-free! (mut vertices)))
+              (>= (load kind) 7)
+                (let [(mut vertices) (generate-tree (- (load kind) 7))]
+                  (loop (if (>= (load i) (al/al-len (load vertices)))
+                            (break 0)
+                            0)
+                    (let [vertex (al/al-get (load vertices) (load i))]
+                      (include-point! (mut bounds) (load (field vertex p))))
+                    (store! i (+ (load i) 1)))
+                  (al/al-free! (mut vertices)))
+              :else 0)
+        (store! (index cache (load kind)) (load bounds)))
+      (store! kind (+ (load kind) 1)))
+    (load cache)))
+
+(defn tree-body [(x f64)
+                 (y f64)
+                 (z f64)
+                 (members i64)
+                 (color r/Color)
+                 (wire bool)
+                 (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [bark color
+        base (r/v3 x (+ y 0.04) z)
+        fork (r/v3 (+ x 0.035) (+ y 0.58) (- z 0.025))
+        phase (* (cast f64 (% members 17)) 0.037)
+        (mut root) 0]
+    (limb base fork 0.068 0.048 bark wire sink)
+    (loop (if (>= (load root) 5) (break 0) 0)
+      (let [a (+ phase (* (cast f64 (load root)) 1.2566370614))]
+        (limb (r/v3 (+ x (* 0.30 (r/cos a)))
+                    (+ y 0.05)
+                    (+ z (* 0.30 (r/sin a))))
+              (r/v3 x (+ y 0.27) z)
+              0.012
+              0.028
+              bark
+              wire
+              sink))
+      (store! root (+ (load root) 1)))
+    (branch fork phase 0.82 5 bark wire sink)
+    (branch fork (+ phase 2.13) 0.76 5 bark wire sink)
+    (branch fork (+ phase 4.25) 0.70 5 bark wire sink)))
+
+(defn generate-tree [(members i64)] (-> (al/ArrayList terrain/Vertex))
+  (let [(mut vertices) (al/al-new [terrain/Vertex] (alloc/malloc-allocator))]
+    (tree-body 0.0
+               1.99
+               0.0
+               members
+               (r/rgba 255 255 255 255)
+               false
+               (mut vertices))
+    (load vertices)))
+
+(defn bake-trees [] (-> (array r/Model 17))
+  (let [(mut models) (zeroed (array r/Model 17))
+        (mut i) 0]
+    (loop (if (>= (load i) 17) (break 0) 0)
+      (let [(mut vertices) (generate-tree (load i))]
+        (store! (index models (load i)) (terrain/upload (load vertices)))
+        (al/al-free! (mut vertices)))
+      (store! i (+ (load i) 1)))
+    (load models)))
+
+(defn offset-uniform! [(shader r/Shader) (location i32) (data (ptr f32))] (-> i64)
+  (r/SetShaderValue shader location (cast (ptr u8) data) 2)
+  0)
+
+(defn scalar-uniform! [(shader r/Shader) (location i32) (data (ptr f32))] (-> i64)
+  (if (>= location (cast i32 0))
+      (do (r/SetShaderValue shader location (cast (ptr u8) data) 0) 0)
+      0))
+
+(defn cached-model [(model r/Model)
+                    (p r/Vector3)
+                    (color r/Color)
+                    (shader r/Shader)
+                    (shadow r/Texture)] (-> i64)
+  (cached-model-scaled model
+                       (r/v3 (cast f64 (load (field p x)))
+                             1.99
+                             (cast f64 (load (field p z))))
+                       1.0
+                       color
+                       shader
+                       shadow))
+
+;;; Match DrawModel's transform in the world-space lighting/shadow varyings.
+;;; The anchor is the foundation plane, not the local mesh origin.
+(defn cached-model-scaled [(model r/Model)
+                           (anchor r/Vector3)
+                           (scale f64)
+                           (color r/Color)
+                           (shader r/Shader)
+                           (shadow r/Texture)] (-> i64)
+  (let [material (index (load (field model materials)) 0)
+        location (r/GetShaderLocation shader c"glyphOffset")
+        scale-location (r/GetShaderLocation shader c"glyphScale")
+        shadow-location (r/GetShaderLocation shader c"shadowMap")
+        (mut offset)
+          (r/v3 (cast f64 (load (field anchor x)))
+                (- (cast f64 (load (field anchor y))) (* 1.99 scale))
+                (cast f64 (load (field anchor z))))
+        (mut factor) (cast f32 scale)
+        (mut identity) (cast f32 1.0)
+        (mut origin) (r/v3 0.0 0.0 0.0)]
+    (r/rlDrawRenderBatchActive)
+    (store! (field material shader) shader)
+    (if (>= shadow-location (cast i32 0))
+        (do
+          (store! (index (load (field shader locs)) 16) shadow-location)
+          (store! (field (index (load (field material maps)) 1) texture) shadow))
+        0)
+    (offset-uniform! shader location (field offset x))
+    (scalar-uniform! shader scale-location (mut factor))
+    (r/DrawModel model (load offset) (cast f32 scale) color)
+    (offset-uniform! shader location (field origin x))
+    (scalar-uniform! shader scale-location (mut identity))
+    ;; Mesh drawing unbinds material textures. Re-register the shadow sampler
+    ;; for subsequent immediate geometry; the previous batch was flushed above.
+    (if (>= shadow-location (cast i32 0))
+        (do (r/SetShaderValueTexture shader shadow-location shadow) 0)
+        0)
+    0))
+
+(defn glyph-color [(state i64) (selected bool)] (-> r/Color)
+  (cond (= state 1) (r/rgba 207 137 55 255)
+        (= state 2) (r/rgba 96 170 151 255)
+        (= state 3) (r/rgba 160 94 84 180)
+        selected (r/rgba 190 183 158 255)
+        :else (r/rgba 82 91 96 255)))
+
+;;; Pale satin branches distinguish trees from graphite buildings. Edit hues
+;;; retain channel headroom; the old 1.85 multiplier clipped amber and mint.
+(defn tree-color [(state i64) (selected bool)] (-> r/Color)
+  (if (= state 0)
+      (if selected (r/rgba 242 225 183 255) (r/rgba 218 220 211 255))
+      (r/shade (glyph-color state false) 1.15)))
+
+(defn slab-cache-index [(levels i64) (state i64) (selected bool)] (-> i64)
+  (+ (* (if (and (= state 0) selected) 4 state) 9)
+     (- levels 3)))
+
+(defn slab-body [(x f64)
+                 (z f64)
+                 (levels i64)
+                 (color r/Color)
+                 (wire bool)
+                 (sink (ptr (al/ArrayList terrain/Vertex)))] (-> i64)
+  (let [(mut i) 0]
+    (if (not wire)
+        (let [height (+ 0.095 (* (cast f64 (- levels 1)) 0.24))
+              center (+ 2.035 (* height 0.5))
+              (mut side) 0]
+          ;; A recessed opaque panel volume and a continuous ten-post frame.
+          ;; Posts penetrate the floor solids, avoiding cracks at their joins.
+          (box-into x center z 0.90 height 0.74 (r/shade color 0.38) sink)
+          (loop (if (>= (load side) 2) (break 0) 0)
+            (let [sign (if (= (load side) 0) -1.0 1.0)
+                  (mut bay) 0]
+              (loop (if (>= (load bay) 4) (break 0) 0)
+                (box-into (+ x (+ -0.47 (* (cast f64 (load bay)) (/ 0.94 3.0))))
+                          center
+                          (+ z (* sign 0.385))
+                          0.035
+                          height
+                          0.035
+                          (r/shade color 0.85)
+                          sink)
+                (store! bay (+ (load bay) 1)))
+              (box-into (+ x (* sign 0.47))
+                        center
+                        z
+                        0.035
+                        height
+                        0.035
+                        (r/shade color 0.85)
+                        sink))
+            (store! side (+ (load side) 1))))
+        0)
+    (loop (if (>= (load i) levels) (break 0) 0)
+      (stacked-slab x
+                    (+ 1.99 (+ 0.14 (* (cast f64 (load i)) 0.24)))
+                    z
+                    (r/shade color (+ 0.76 (* (cast f64 (load i)) 0.035)))
+                    wire
+                    sink)
+      (store! i (+ (load i) 1)))
+    (if (not wire)
+        (box-into x
+                  (+ 1.99 (+ 0.1975 (* (cast f64 (- levels 1)) 0.24)))
+                  z
+                  0.98
+                  0.010
+                  0.77
+                  (r/shade color 0.78)
+                  sink)
+        0)))
+
+(defn generate-slabs [(levels i64) (palette i64)] (-> (al/ArrayList terrain/Vertex))
+  (let [(mut vertices) (al/al-new [terrain/Vertex] (alloc/malloc-allocator))]
+    (slab-body 0.0
+               0.0
+               levels
+               (glyph-color (if (= palette 4) 0 palette) (= palette 4))
+               false
+               (mut vertices))
+    (load vertices)))
+
+(defn bake-slabs [] (-> (array r/Model 45))
+  (let [(mut models) (zeroed (array r/Model 45))
+        (mut i) 0]
+    (loop (if (>= (load i) 45) (break 0) 0)
+      (let [(mut vertices) (generate-slabs (+ 3 (% (load i) 9)) (/ (load i) 9))]
+        (store! (index models (load i)) (terrain/upload (load vertices)))
+        (al/al-free! (mut vertices)))
+      (store! i (+ (load i) 1)))
+    (load models)))
+
+(defn draw [(entity m/Entity)
+            (state i64)
+            (selected bool)
+            (wire bool)
+            (time f64)] (-> i64)
+  (draw-symbol (load (field entity position))
+               (load (field entity kind))
+               (load (field entity members))
+               (struct-levels entity)
+               state
+               selected
+               wire
+               time))
+
+;;; Explicit symbol parameters also support aggregates without fake entities.
+(defn draw-symbol-scaled [(anchor r/Vector3)
+                          (scale f64)
+                          (kind i64)
+                          (members i64)
+                          (levels i64)
+                          (state i64)
+                          (selected bool)
+                          (wire bool)
+                          (time f64)] (-> i64)
+  (r/rlPushMatrix)
+  (r/rlTranslatef (load (field anchor x))
+                  (load (field anchor y))
+                  (load (field anchor z)))
+  (r/rlScalef (cast f32 scale) (cast f32 scale) (cast f32 scale))
+  (r/rlTranslatef 0.0 -1.99 0.0)
+  (draw-symbol (r/v3 0.0 1.99 0.0) kind members levels state selected wire time)
+  (r/rlPopMatrix)
+  0)
+
+(defn draw-symbol [(p r/Vector3)
+                   (kind i64)
+                   (members i64)
+                   (levels i64)
+                   (state i64)
+                   (selected bool)
+                   (wire bool)
+                   (time f64)] (-> i64)
+  (let [x (cast f64 (load (field p x)))
+        z (cast f64 (load (field p z)))
+        y 1.99
+        color (glyph-color state selected)]
+    (if (= kind 3)
+        (if wire
+            (do
+              (r/DrawCylinderWires (r/v3 x (- y 0.015) z)
+                                   0.59
+                                   0.62
+                                   0.05
+                                   24
+                                   color)
+              0)
+            (do
+              (vertical-cylinder (r/v3 x (- y 0.015) z)
+                                 0.59
+                                 0.62
+                                 0.05
+                                 24
+                                 (r/shade color 0.65))
+              0))
+        (block-shape x
+                     (+ y 0.015)
+                     z
+                     1.38
+                     0.06
+                     1.22
+                     (if wire color (r/rgba 37 43 40 255))
+                     wire))
+    (cond (= kind 0)
+            (if wire
+                (slab-body x
+                           z
+                           levels
+                           color
+                           true
+                           (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+                0)
+          (= kind 1)
+            (let [(mut i) 0]
+              (if wire
+                  (do
+                    (r/DrawCylinderWires (r/v3 x (+ y 0.15) z)
+                                         0.2
+                                         0.25
+                                         0.3
+                                         12
+                                         color)
+                    0)
+                  (do
+                    (vertical-cylinder (r/v3 x (+ y 0.15) z)
+                                       0.2
+                                       0.25
+                                       0.3
+                                       12
+                                       color)
+                    0))
+              (loop (if (>= (load i) 9) (break 0) 0)
+                (fan-leaf x
+                          y
+                          z
+                          (+ -1.55 (* (cast f64 (load i)) 0.35))
+                          (r/shade color (+ 0.78 (* (cast f64 (load i)) 0.025)))
+                          wire)
+                (store! i (+ (load i) 1))))
+          (= kind 2)
+            (if wire
+                (courtyard-body color
+                                true
+                                (r/v3 x y z)
+                                (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+                0)
+          (= kind 3)
+            (do
+              (ring (r/v3 x (+ y 0.052) z) 0.52 (r/shade color 1.2))
+              (ring (r/v3 x (+ y 0.052) z) 0.42 (r/shade color 0.9))
+              (if wire
+                  (tree-body x
+                             y
+                             z
+                             members
+                             (tree-color state selected)
+                             true
+                             (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+                  0))
+          (= kind 4)
+            (let [(mut i) 0]
+              (loop (if (>= (load i) 3) (break 0) 0)
+                (queue-channel (+ x (* (cast f64 (- (load i) 1)) 0.46))
+                               y
+                               z
+                               color
+                               wire)
+                (store! i (+ (load i) 1))))
+          (= kind 5)
+            (let [(mut i) 0]
+              (loop (if (>= (load i) 6) (break 0) 0)
+                (let [a (* (cast f64 (load i)) 1.047197551)
+                      b (+ a 2.0943951)
+                      u
+                        (r/v3 (+ x (* 0.65 (r/cos a)))
+                              (+ y (+ 0.4 (* 0.3 (r/sin (* a 2.0)))))
+                              (+ z (* 0.65 (r/sin a))))
+                      v
+                        (r/v3 (+ x (* 0.65 (r/cos b)))
+                              (+ y (+ 0.4 (* 0.3 (r/sin (* b 2.0)))))
+                              (+ z (* 0.65 (r/sin b))))]
+                  (if wire
+                      (do (r/DrawSphereWires u 0.12 6 8 color) 0)
+                      (sphere u 0.12 6 12 color))
+                  (if wire
+                      (do (r/DrawLine3D u v (r/shade color 1.4)) 0)
+                      (do
+                        (cylinder u
+                                  v
+                                  0.018
+                                  0.018
+                                  6
+                                  (r/shade color 1.15))
+                        0)))
+                (store! i (+ (load i) 1))))
+          :else
+            (if wire
+                (function-body (r/v3 x y z)
+                               color
+                               true
+                               (cast (ptr (al/ArrayList terrain/Vertex)) 0))
+                0))
+    (if (or selected (!= state 0))
+        (do
+          (ring (r/v3 x 2.02 z) 0.86 (r/shade color 1.5))
+          (if selected (ring (r/v3 x 2.02 z) 1.03 (r/shade color 1.1)) 0)
+          (if (and (not wire) (!= state 0))
+              (let [rise (* 1.5 (- time (r/floor time)))]
+                (sphere (r/v3 (+ x 0.5) (+ y rise) z)
+                        0.045
+                        4
+                        6
+                        (r/shade color 1.7))
+                0)
+              0))
+        0)
+    0))

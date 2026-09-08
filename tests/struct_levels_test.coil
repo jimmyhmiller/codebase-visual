@@ -1,0 +1,70 @@
+(module atlas.tests.struct-levels)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+
+(deftest struct-tiers-use-complete-fields-not-type-expression-size
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut s)
+                                       "simple.coil"
+                                       "(defstruct Simple [(a i64) (b i64) (c i64)])")
+             (analyzer/analyze-source! (mut s)
+                                       "nested.coil"
+                                       "(defstruct Nested [T] [(a (slice (ptr T))) (b (fn [T i64] (-> bool))) (c (array (ptr T) 32))])")
+             (analyzer/analyze-source! (mut s)
+                                       "growth.coil"
+                                       "(defstruct Growth [(a i64) (b i64) (c i64) (d i64)])")
+             (let [simple (al/al-get (load (field s entities)) 0)
+                   nested (al/al-get (load (field s entities)) 1)
+                   growth (al/al-get (load (field s entities)) 2)]
+               (assert (load (field simple details-known)))
+               (assert (load (field nested details-known)))
+               (assert (!= (load (field simple members))
+                           (load (field nested members))))
+               (assert (= (glyph/struct-levels simple) 5))
+               (assert (= (glyph/struct-levels nested) 5))
+               (assert (= (glyph/struct-levels growth) 6))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest struct-tiers-are-bounded-and-match-cached-picking-envelopes
+         (let [(mut e) (zeroed m/Entity)
+               (mut count) 0]
+           (store! (field e details)
+                   (al/al-new [m/MemberDetail] (alloc/malloc-allocator)))
+           (store! (field e details-known) true)
+           (loop (if (> (load count) 64) (break 0) 0)
+             (let [levels (glyph/struct-levels (load e))
+                   expected
+                     (if (< (load count) 1)
+                         3
+                         (if (> (load count) 9) 11 (+ 2 (load count))))
+                   bounds (glyph/struct-bounds (r/v3 0.0 2.0 0.0) levels)
+                   (mut vertices) (glyph/generate-slabs levels 0)
+                   (mut i) 0]
+               (assert (= levels expected))
+               (assert (= (glyph/slab-cache-index levels 0 false) (- levels 3)))
+               (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+                 (let [v (al/al-get (load vertices) (load i))
+                       y (load (field (field v p) y))]
+                   (assert (>= y (load (field (field bounds min) y))))
+                   (assert (<= y (load (field (field bounds max) y)))))
+                 (store! i (+ (load i) 1)))
+               (al/al-free! (mut vertices)))
+             (al/al-push! (mut (field e details)) (zeroed m/MemberDetail))
+             (store! count (+ (load count) 1)))
+           ;; Partial metadata must never masquerade as a complete 65-field record.
+           (store! (field e details-known) false)
+           (store! (field e members) 22)
+           (assert (= (glyph/struct-levels (load e)) 5))
+           (store! (field e members) -1)
+           (assert (= (glyph/struct-levels (load e)) 3))
+           (store! (field e members) 10000)
+           (assert (= (glyph/struct-levels (load e)) 11))
+           (al/al-free! (mut (field e details)))))

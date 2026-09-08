@@ -1,0 +1,37 @@
+(module atlas.tests.cylinder)
+(import "atlas.ray" :as r)
+(import "atlas.glyphs" :as glyph)
+
+(defn check-axis [(direction r/Vector3)] (-> i64)
+  (let [axis (glyph/vector-unit direction)
+        u (glyph/cylinder-tangent axis)
+        v (glyph/vector-cross axis u)
+        normal (glyph/cylinder-normal u axis 2.0 0.4 0.1)
+        side
+          (glyph/vector-add (glyph/vector-scale axis 2.0)
+                            (glyph/vector-scale u -0.3))]
+    (assert (< (r/fabs (- (glyph/vector-dot u u) 1.0)) 0.000001))
+    (assert (< (r/fabs (- (glyph/vector-dot v v) 1.0)) 0.000001))
+    (assert (< (r/fabs (glyph/vector-dot axis u)) 0.000001))
+    (assert (> (glyph/vector-dot (glyph/vector-cross u v) axis) 0.99999))
+    (assert (< (r/fabs (- (glyph/vector-dot normal normal) 1.0)) 0.000001))
+    (assert (< (r/fabs (glyph/vector-dot normal side)) 0.000001))
+    (assert (> (glyph/vector-dot normal u) 0.0))
+    0))
+
+(deftest cylinder-basis-and-taper-normals
+         (check-axis (r/v3 0.0 1.0 0.0))
+         (check-axis (r/v3 0.0 -1.0 0.0))
+         (check-axis (r/v3 1.0 0.0 0.0))
+         (check-axis (r/v3 0.0 0.0 1.0))
+         (check-axis (r/v3 0.00001 1.0 -0.00001))
+         (check-axis (r/v3 1.0 2.0 -3.0)))
+
+(deftest cylinder-straight-and-reverse-taper
+         (let [axis (r/v3 0.0 1.0 0.0)
+               radial (r/v3 1.0 0.0 0.0)
+               straight (glyph/cylinder-normal radial axis 1.0 0.2 0.2)
+               widening (glyph/cylinder-normal radial axis 1.0 0.1 0.4)]
+           (assert (< (r/fabs (glyph/vector-dot straight axis)) 0.000001))
+           (assert (> (glyph/vector-dot straight radial) 0.99999))
+           (assert (< (glyph/vector-dot widening axis) 0.0))))

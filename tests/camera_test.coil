@@ -1,0 +1,117 @@
+(module atlas.tests.camera)
+(import "atlas.ray" :as r)
+
+(deftest compass-matches-projected-north
+         (let [target (r/v3 0.0 0.0 0.0)
+               camera (r/orbit-camera target 0.65 0.72 12.0)
+               center (r/GetWorldToScreenEx target camera 1100 824)
+               north (r/GetWorldToScreenEx (r/v3 0.0 0.0 -1.0) camera 1100 824)
+               dx
+                 (- (cast f64 (load (field north x)))
+                    (cast f64 (load (field center x))))
+               dy
+                 (- (cast f64 (load (field north y)))
+                    (cast f64 (load (field center y))))
+               length (r/sqrt (+ (* dx dx) (* dy dy)))
+               direction (r/compass-direction 0.65 0.72 0.0)]
+           (assert (< (r/fabs (- (/ dx length)
+                                 (cast f64 (load (field direction x)))))
+                      0.00001))
+           (assert (< (r/fabs (- (/ dy length)
+                                 (cast f64 (load (field direction y)))))
+                      0.00001))))
+
+(deftest camera-pan-basis-is-orthonormal
+         (let [origin (r/v3 0.0 0.0 0.0)
+               right (r/pan-target origin 0.65 1.0 0.0)
+               forward (r/pan-target origin 0.65 0.0 1.0)
+               diagonal (r/pan-target origin 0.65 1.0 1.0)]
+           (assert (< (r/fabs (- (r/distance2 origin right) 1.0)) 0.000001))
+           (assert (< (r/fabs (- (r/distance2 origin forward) 1.0)) 0.000001))
+           (assert (< (r/fabs (- (r/distance2 origin diagonal) 2.0)) 0.000001))))
+
+(deftest keyboard-pan-has-uniform-projected-speed-at-every-heading
+         (let [(mut angle) 0]
+           (loop (if (>= (load angle) 12) (break 0) 0)
+             (let [yaw (* (cast f64 (load angle)) 0.53)
+                   pitch (+ 0.25 (* (cast f64 (% (load angle) 5)) 0.3))
+                   zoom (+ 5.0 (* (cast f64 (load angle)) 20.0))
+                   target (r/v3 10.0 2.0 -3.0)
+                   camera (r/orbit-camera target yaw pitch zoom)
+                   before (r/GetWorldToScreenEx target camera 1100 824)
+                   (mut direction) 0]
+               (loop (if (>= (load direction) 9) (break 0) 0)
+                 (let [side (cast f64 (- (% (load direction) 3) 1))
+                       forward (cast f64 (- (/ (load direction) 3) 1))
+                       distance
+                         (r/keyboard-distance side forward zoom 0.1 pitch)
+                       next
+                         (r/pan-target target
+                                       yaw
+                                       (cast f64 (load (field distance x)))
+                                       (cast f64 (load (field distance y))))
+                       after
+                         (r/GetWorldToScreenEx target
+                                               (r/orbit-camera next
+                                                               yaw
+                                                               pitch
+                                                               zoom)
+                                               1100
+                                               824)
+                       dx
+                         (- (cast f64 (load (field after x)))
+                            (cast f64 (load (field before x))))
+                       dy
+                         (- (cast f64 (load (field after y)))
+                            (cast f64 (load (field before y))))
+                       expected (if (= (load direction) 4) 0.0 (* 824.0 0.055))]
+                   (assert (< (r/fabs (- (r/sqrt (+ (* dx dx) (* dy dy)))
+                                         expected))
+                              0.01))
+                   (assert (< (r/fabs (- (cast f64 (load (field next y))) 2.0))
+                              0.000001)))
+                 (store! direction (+ (load direction) 1))))
+             (store! angle (+ (load angle) 1)))))
+
+(deftest drag-reprojects-to-mouse-displacement
+         (let [target (r/v3 10.0 2.0 20.0)
+               camera (r/orbit-camera target 0.65 0.72 12.0)
+               delta (r/v2 80.0 40.0)
+               travel (r/drag-distance delta 12.0 824.0 0.72)
+               next
+                 (r/pan-target target
+                               0.65
+                               (cast f64 (load (field travel x)))
+                               (cast f64 (load (field travel y))))
+               after (r/orbit-camera next 0.65 0.72 12.0)
+               before-screen (r/GetWorldToScreenEx target camera 1100 824)
+               after-screen (r/GetWorldToScreenEx target after 1100 824)]
+           (assert (< (r/fabs (- (- (cast f64 (load (field after-screen x)))
+                                    (cast f64 (load (field before-screen x))))
+                                 80.0))
+                      0.01))
+           (assert (< (r/fabs (- (- (cast f64 (load (field after-screen y)))
+                                    (cast f64 (load (field before-screen y))))
+                                 40.0))
+                      0.01))))
+
+(deftest panning-preserves-focus-height
+         (let [anchor (r/v3 10.0 2.0 -3.0)
+               idle (r/pan-target anchor 0.65 0.0 0.0)
+               moved (r/pan-target anchor 0.65 2.0 3.0)]
+           (assert (< (r/distance2 anchor idle) 0.000001))
+           (assert (< (r/fabs (- (cast f64 (load (field idle y))) 2.0))
+                      0.000001))
+           (assert (< (r/fabs (- (cast f64 (load (field moved y))) 2.0))
+                      0.000001))))
+
+(deftest orbit-translates-with-elevated-target
+         (let [low (r/orbit-camera (r/v3 10.0 0.0 -3.0) 0.65 0.72 12.0)
+               high (r/orbit-camera (r/v3 10.0 2.0 -3.0) 0.65 0.72 12.0)
+               lp (load (field low position))
+               hp (load (field high position))]
+           (assert (< (r/distance2 lp hp) 0.000001))
+           (assert (< (r/fabs (- (- (cast f64 (load (field hp y)))
+                                    (cast f64 (load (field lp y))))
+                                 2.0))
+                      0.00001))))

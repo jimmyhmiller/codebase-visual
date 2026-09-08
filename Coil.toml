@@ -1,0 +1,15 @@
+[package]
+name = "atlas"
+entry = "src/main.coil"
+source-roots = ["src", "tests"]
+
+[native-dependencies]
+raylib = { pkg-config = "raylib" }
+git2 = { pkg-config = "libgit2" }
+
+[link]
+libs = ["pthread", "m"]
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

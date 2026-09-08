@@ -1,0 +1,25 @@
+(module atlas.tests.tree-mesh)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+
+(deftest cached-tree-retains-full-branch-geometry
+         (let [(mut variant) 0]
+           (loop (if (>= (load variant) 17) (break 0) 0)
+             (let [(mut vertices) (glyph/generate-tree (load variant))
+                   (mut i) 0]
+               ;; 186 recursive segments, one trunk and five roots, six sides,
+               ;; two side triangles and two caps per side.
+               (assert (= (al/al-len (load vertices)) 13824))
+               (loop (if (>= (load i) (al/al-len (load vertices))) (break 0) 0)
+                 (let [v (al/al-get (load vertices) (load i))
+                       n (load (field v normal))
+                       p (load (field v p))]
+                   (assert (< (r/fabs (- (glyph/vector-dot n n) 1.0)) 0.00001))
+                   (assert (< (r/fabs (cast f64 (load (field p x)))) 3.0))
+                   (assert (< (r/fabs (cast f64 (load (field p z)))) 3.0))
+                   (assert (> (cast f64 (load (field p y))) 1.99))
+                   (assert (< (cast f64 (load (field p y))) 5.0)))
+                 (store! i (+ (load i) 1)))
+               (al/al-free! (mut vertices)))
+             (store! variant (+ (load variant) 1)))))

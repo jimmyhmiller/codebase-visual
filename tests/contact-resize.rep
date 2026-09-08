@@ -1,0 +1,7 @@
+# Exercise replacement of both color and sampleable depth attachments.
+c 5
+e 10 21 1100 720 0 0
+e 45 21 1440 900 0 0
+e 80 21 1600 1000 0 0
+e 85 2 82 0 0 0
+e 86 1 82 0 0 0

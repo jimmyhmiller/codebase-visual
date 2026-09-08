@@ -1,0 +1,13 @@
+# Diagonal travel, reset, then select and focus the calibrated Order roof.
+c 11
+e 10 2 87 0 0 0
+e 10 2 68 0 0 0
+e 40 1 87 0 0 0
+e 40 1 68 0 0 0
+e 70 2 82 0 0 0
+e 71 1 82 0 0 0
+e 100 7 779 525 0 0
+e 101 6 0 0 0 0
+e 102 5 0 0 0 0
+e 120 2 70 0 0 0
+e 121 1 70 0 0 0

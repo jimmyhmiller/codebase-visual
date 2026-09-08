@@ -1,0 +1,38 @@
+(module atlas.tests.inspector)
+(import "atlas.view" :as view)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+
+(deftest changed-list-rows-and-shrinking-scroll
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut snapshot) (m/new-snapshot a)]
+             (m/emit! (mut snapshot) "a" "Unchanged" 0 1 1 1)
+             (m/emit! (mut snapshot) "a" "Ghost" 0 1 1 2)
+             (m/emit! (mut snapshot) "a" "Added" 0 1 1 3)
+             (let [ghost
+                     (al/al-elem [m/Entity] (mut (field snapshot entities)) 1)
+                   added
+                     (al/al-elem [m/Entity] (mut (field snapshot entities)) 2)]
+               (store! (field ghost state) 3)
+               (store! (field added state) 2))
+             (assert-eq (view/changed-index (mut snapshot) -1) -1)
+             (assert-eq (view/changed-index (mut snapshot) 0) 1)
+             (assert-eq (view/changed-index (mut snapshot) 1) 2)
+             (assert-eq (view/changed-index (mut snapshot) 2) -1)
+             (assert (< (r/fabs (- (view/inspector-offset (mut snapshot)
+                                                          900.0
+                                                          4000.0)
+                                   108.0))
+                        0.001))
+             (al/al-clear! (mut (field snapshot entities)))
+             (assert-eq (view/changed-index (mut snapshot) 0) -1)
+             (assert (< (r/fabs (view/inspector-offset (mut snapshot)
+                                                       900.0
+                                                       108.0))
+                        0.001)))
+           (scratch/scratch-close! (mut arena))))

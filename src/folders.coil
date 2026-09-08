@@ -1,0 +1,377 @@
+(module atlas.folders)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "atlas.impact" :as impact)
+(import "coil.hashmap" :as hm)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-len slice-get subslice])
+
+;;; Append-only path identities. Parent indices always precede their children.
+;;; File islands and folder territories are distinct: a folder never invents
+;;; declarations or borrows an analyzer's module namespace.
+(defstruct Node
+  [(path (slice u8))
+   (parent i64)
+   (depth i64)
+   (directory bool)
+   (island i64)
+   (position r/Vector3)
+   (radius f64)
+   (border-first i64)
+   (border-count i64)
+   (border-label r/Vector3)
+   (first-child i64)
+   (next-sibling i64)])
+
+(defstruct Tree
+  [(nodes (al/ArrayList Node))
+   (index (hm/HashMap impact/NameKey i64))
+   (borders (al/ArrayList r/Vector3))])
+
+(defn new-tree [(a (dyn alloc/Allocator))] (-> Tree)
+  (let [(mut tree) (zeroed Tree)]
+    (store! (field tree nodes) (al/al-new [Node] a))
+    (store! (field tree borders) (al/al-new [r/Vector3] a))
+    (let [ops (alloc/box! a hm/KeyOps (zeroed hm/KeyOps))]
+      (store! (field ops hash) (primitive/fnptr-of impact/name-hash))
+      (store! (field ops eq) (primitive/fnptr-of impact/name-equal))
+      (store! (field ops size) (primitive/sizeof impact/NameKey))
+      (store! (field tree index) (hm/hm-new [impact/NameKey i64] a ops)))
+    (al/al-push! (mut (field tree nodes))
+                 (Node
+                   :path ""
+                   :parent -1
+                   :depth 0
+                   :directory true
+                   :island -1
+                   :first-child -1
+                   :next-sibling -1
+                   :position (r/v3 0.0 0.0 0.0)
+                   :border-first 0
+                   :border-count 0
+                   :border-label (r/v3 0.0 0.0 0.0)
+                   :radius 0.0))
+    (index-node! (mut tree) "" 0)
+    (load tree)))
+
+(defn index-node! [(tree (ptr Tree)) (path (slice u8)) (at i64)] (-> i64)
+  (let [node (al/al-get (load (field tree nodes)) at)]
+    (hm/hm-put! (field tree index)
+                (impact/NameKey :module
+                                  (if (load (field node directory)) "/" "")
+                  :name path)
+                at)))
+
+(defn find [(tree (ptr Tree)) (path (slice u8))] (-> i64)
+  (let [directory
+          (impact/name-value (load (field tree index))
+                             (impact/NameKey :module "/" :name path))]
+    (if (>= directory 0) directory (find-file tree path))))
+
+(defn find-file [(tree (ptr Tree)) (path (slice u8))] (-> i64)
+  (impact/name-value (load (field tree index))
+                     (impact/NameKey :module "" :name path)))
+
+(defn register! [(tree (ptr Tree)) (path (slice u8))] (-> i64)
+  (let [(mut parent) 0
+        (mut i) 0
+        (mut depth) 1
+        a (load (field (field tree nodes) alc))]
+    (loop (if (or (= (slice-len path) 0) (> (load i) (slice-len path)))
+              (break (load parent))
+              0)
+      (if (or (= (load i) (slice-len path))
+              (= (slice-get path (load i)) (cast u8 47)))
+          (let [prefix (subslice path 0 (load i))
+                found
+                  (impact/name-value (load (field tree index))
+                                     (impact/NameKey :module
+                                                       (if (< (load i)
+                                                              (slice-len path))
+                                                           "/"
+                                                           "")
+                                       :name prefix))
+                at (if (>= found 0) found (al/al-len (load (field tree nodes))))]
+            (if (< found 0)
+                (al/al-push! (field tree nodes)
+                             (Node
+                               :path (m/copy-text a prefix)
+                               :parent (load parent)
+                               :depth (load depth)
+                               :directory (< (load i) (slice-len path))
+                               :first-child -1
+                               :next-sibling -1
+                               :island -1
+                               :position (r/v3 0.0 0.0 0.0)
+                               :border-first 0
+                               :border-count 0
+                               :border-label (r/v3 0.0 0.0 0.0)
+                               :radius 0.0))
+                0)
+            (if (< found 0)
+                (let [node (al/al-get (load (field tree nodes)) at)]
+                  (index-node! tree (load (field node path)) at)
+                  (link-node! tree at))
+                0)
+            (store! parent at)
+            (store! depth (+ (load depth) 1)))
+          0)
+      (store! i (+ (load i) 1)))))
+
+(defn node-before? [(a Node) (b Node)] (-> bool)
+  (if (!= (load (field a directory)) (load (field b directory)))
+      (load (field a directory))
+      (< (str/str-cmp (load (field a path)) (load (field b path))) 0)))
+
+(defn link-node! [(tree (ptr Tree)) (at i64)] (-> i64)
+  (let [nodes (field tree nodes)
+        node (al/al-elem [Node] nodes at)
+        parent (al/al-elem [Node] nodes (load (field node parent)))
+        (mut previous) -1
+        (mut current) (load (field parent first-child))]
+    (loop (if (< (load current) 0) (break 0) 0)
+      (let [other (al/al-get (load nodes) (load current))]
+        (if (node-before? (load node) other) (break 0) 0)
+        (store! previous (load current))
+        (store! current (load (field other next-sibling)))))
+    (store! (field node next-sibling) (load current))
+    (if (< (load previous) 0)
+        (store! (field parent first-child) at)
+        (store! (field (al/al-elem [Node] nodes (load previous)) next-sibling)
+                at))
+    0))
+
+(defn descendant? [(tree (ptr Tree)) (child i64) (ancestor i64)] (-> bool)
+  (let [(mut at) child]
+    (loop (if (< (load at) 0) (break false) 0)
+      (if (= (load at) ancestor) (break true) 0)
+      (let [n (al/al-get (load (field tree nodes)) (load at))]
+        (store! at (load (field n parent)))))))
+
+(defn copy-tree [(source (ptr Tree)) (a (dyn alloc/Allocator))] (-> Tree)
+  (let [(mut result) (new-tree a)
+        (mut i) 0]
+    (al/al-clear! (mut (field result nodes)))
+    (loop (if (>= (load i) (al/al-len (load (field source nodes)))) (break 0) 0)
+      (let [(mut n) (al/al-get (load (field source nodes)) (load i))]
+        (store! (field n path) (m/copy-text a (load (field n path))))
+        (al/al-push! (mut (field result nodes)) (load n))
+        (index-node! (mut result) (load (field n path)) (load i)))
+      (store! i (+ (load i) 1)))
+    (copy-borders! (mut result) source)
+    (load result)))
+
+(defn copy-borders! [(target (ptr Tree)) (source (ptr Tree))] (-> i64)
+  (al/al-clear! (field target borders))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field source borders))))
+              (break 0)
+              0)
+      (al/al-push! (field target borders)
+                   (al/al-get (load (field source borders)) (load i)))
+      (store! i (+ (load i) 1)))
+    0))
+
+;;; Revision census is prepared once alongside its layout, not during seeking.
+;;; Each file contributes one, including unsupported files with no island.
+(defn census! [(tree (ptr Tree)) (snapshot (ptr m/Snapshot))] (-> i64)
+  (al/al-clear! (field snapshot folder-counts))
+  (al/al-clear! (field snapshot folder-structures))
+  (al/al-clear! (field snapshot folder-changed))
+  (al/al-clear! (field snapshot folder-removed))
+  (let [(mut i) 0
+        n (al/al-len (load (field tree nodes)))]
+    (loop (if (>= (load i) n) (break 0) 0)
+      (al/al-push! (field snapshot folder-counts) 0)
+      (al/al-push! (field snapshot folder-structures) 0)
+      (al/al-push! (field snapshot folder-changed) 0)
+      (al/al-push! (field snapshot folder-removed) 0)
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field snapshot paths))))
+              (break 0)
+              0)
+      (let [at
+              (find-file tree
+                         (al/al-get (load (field snapshot paths)) (load i)))]
+        (if (>= at 0)
+            (store! (al/al-elem [i64] (field snapshot folder-counts) at) 1)
+            0))
+      (store! i (+ (load i) 1)))
+    ; Analyzer-only fixtures and adapters still have their source inventory.
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field snapshot sources))))
+              (break 0)
+              0)
+      (let [s (al/al-get (load (field snapshot sources)) (load i))
+            at (find-file tree (load (field s path)))]
+        (if (>= at 0)
+            (store! (al/al-elem [i64] (field snapshot folder-counts) at) 1)
+            0))
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) (al/al-len (load (field snapshot entities))))
+              (break 0)
+              0)
+      (let [e (al/al-get (load (field snapshot entities)) (load i))
+            at (find-file tree (load (field e path)))]
+        (if (>= at 0)
+            (if (= (load (field e state)) 3)
+                (increment! (field snapshot folder-removed) at 1)
+                (do
+                  (increment! (field snapshot folder-structures) at 1)
+                  (store! (al/al-elem [i64] (field snapshot folder-counts) at)
+                          1)
+                  (if (!= (load (field e state)) 0)
+                      (increment! (field snapshot folder-changed) at 1)
+                      0)))
+            0))
+      (store! i (+ (load i) 1)))
+    (store! i (- n 1))
+    (loop (if (<= (load i) 0) (break 0) 0)
+      (let [node (al/al-get (load (field tree nodes)) (load i))
+            parent
+              (al/al-elem [i64]
+                          (field snapshot folder-counts)
+                          (load (field node parent)))]
+        (store! parent
+                (+ (load parent)
+                   (al/al-get (load (field snapshot folder-counts)) (load i))))
+        (increment! (field snapshot folder-structures)
+                    (load (field node parent))
+                    (al/al-get (load (field snapshot folder-structures))
+                               (load i)))
+        (increment! (field snapshot folder-changed)
+                    (load (field node parent))
+                    (al/al-get (load (field snapshot folder-changed)) (load i)))
+        (increment! (field snapshot folder-removed)
+                    (load (field node parent))
+                    (al/al-get (load (field snapshot folder-removed)) (load i))))
+      (store! i (- (load i) 1)))
+    0))
+
+(defn increment! [(values (ptr (al/ArrayList i64))) (at i64) (amount i64)] (-> i64)
+  (let [out (al/al-elem [i64] values at)] (store! out (+ (load out) amount)) 0))
+
+(defn count-at [(snapshot (ptr m/Snapshot)) (at i64)] (-> i64)
+  (if (and (>= at 0) (< at (al/al-len (load (field snapshot folder-counts)))))
+      (al/al-get (load (field snapshot folder-counts)) at)
+      0))
+
+;;; Persistent user choices are separate from revision presence.
+(defstruct State
+  [(expanded (al/ArrayList bool))
+   (enabled (al/ArrayList bool))
+   (effective (al/ArrayList bool))
+   (rows (al/ArrayList i64))
+   (shown (al/ArrayList i64))
+   (islands (al/ArrayList bool))
+   (selected i64)])
+
+(defn new-state [] (-> State)
+  (let [a (alloc/malloc-allocator)]
+    (State
+      :expanded (al/al-new [bool] a)
+      :enabled (al/al-new [bool] a)
+      :effective (al/al-new [bool] a)
+      :rows (al/al-new [i64] a)
+      :shown (al/al-new [i64] a)
+      :islands (al/al-new [bool] a)
+      :selected -1)))
+
+(defn append-rows! [(state (ptr State))
+                    (tree (ptr Tree))
+                    (snapshot (ptr m/Snapshot))
+                    (at i64)] (-> i64)
+  (if (> (count-at snapshot at) 0)
+      (do
+        (al/al-push! (field state rows) at)
+        (if (al/al-get (load (field state expanded)) at)
+            (let [node (al/al-get (load (field tree nodes)) at)
+                  (mut child) (load (field node first-child))]
+              (loop (if (< (load child) 0) (break 0) 0)
+                (append-rows! state tree snapshot (load child))
+                (let [n (al/al-get (load (field tree nodes)) (load child))]
+                  (store! child (load (field n next-sibling))))))
+            0)
+        0)
+      0))
+
+(defn refresh! [(state (ptr State))
+                (tree (ptr Tree))
+                (snapshot (ptr m/Snapshot))
+                (island-count i64)] (-> i64)
+  (let [n (al/al-len (load (field tree nodes)))
+        (mut i) 0]
+    (loop (if (>= (al/al-len (load (field state expanded))) n) (break 0) 0)
+      (let [node
+              (al/al-get (load (field tree nodes))
+                         (al/al-len (load (field state expanded))))]
+        (al/al-push! (field state expanded) (< (load (field node depth)) 1)))
+      (al/al-push! (field state enabled) true))
+    (al/al-clear! (field state effective))
+    (al/al-clear! (field state rows))
+    (al/al-clear! (field state shown))
+    (al/al-clear! (field state islands))
+    (loop (if (>= (load i) island-count) (break 0) 0)
+      (al/al-push! (field state islands) false)
+      (store! i (+ (load i) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) n) (break 0) 0)
+      (let [node (al/al-get (load (field tree nodes)) (load i))
+            parent (load (field node parent))
+            enabled
+              (and (al/al-get (load (field state enabled)) (load i))
+                   (or (< parent 0)
+                       (al/al-get (load (field state effective)) parent)))
+            island (load (field node island))]
+        (al/al-push! (field state effective) enabled)
+        (al/al-push! (field state shown)
+                     (if (and enabled (not (load (field node directory))))
+                         (count-at snapshot (load i))
+                         0))
+        (if (>= island 0)
+            (store! (al/al-elem [bool] (field state islands) island)
+                    (and enabled (> (count-at snapshot (load i)) 0)))
+            0))
+      (store! i (+ (load i) 1)))
+    (store! i (- n 1))
+    (loop (if (<= (load i) 0) (break 0) 0)
+      (let [node (al/al-get (load (field tree nodes)) (load i))
+            out
+              (al/al-elem [i64] (field state shown) (load (field node parent)))]
+        (store! out
+                (+ (load out) (al/al-get (load (field state shown)) (load i)))))
+      (store! i (- (load i) 1)))
+    (append-rows! state tree snapshot 0)
+    (if (= (count-at snapshot (load (field state selected))) 0)
+        (store! (field state selected) -1)
+        0)
+    0))
+
+(defn toggle! [(state (ptr State))
+               (tree (ptr Tree))
+               (snapshot (ptr m/Snapshot))
+               (at i64)] (-> i64)
+  (let [enable
+          (< (al/al-get (load (field state shown)) at) (count-at snapshot at))
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load (field tree nodes)))) (break 0) 0)
+      (if (or (descendant? tree (load i) at)
+              (and enable (descendant? tree at (load i))))
+          (store! (al/al-elem [bool] (field state enabled) (load i)) enable)
+          0)
+      (store! i (+ (load i) 1)))
+    0))
+
+(defn close! [(state (ptr State))] (-> i64)
+  (al/al-free! (field state expanded))
+  (al/al-free! (field state enabled))
+  (al/al-free! (field state effective))
+  (al/al-free! (field state rows))
+  (al/al-free! (field state shown))
+  (al/al-free! (field state islands))
+  0)

@@ -1,0 +1,12 @@
+# Select the first changed declaration, open dependency lens, then enter live mode.
+c 10
+e 10 7 1390 713 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 25 7 1060 31 0 0
+e 26 6 0 0 0 0
+e 27 5 0 0 0 0
+e 60 2 76 0 0 0
+e 61 1 76 0 0 0
+e 120 2 82 0 0 0
+e 121 1 82 0 0 0

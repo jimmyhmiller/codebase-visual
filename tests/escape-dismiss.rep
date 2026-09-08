@@ -1,0 +1,13 @@
+# Select and focus Order, open its source, then dismiss source and selection.
+c 11
+e 10 7 779 525 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 20 2 70 0 0 0
+e 21 1 70 0 0 0
+e 60 2 86 0 0 0
+e 61 1 86 0 0 0
+e 90 2 256 0 0 0
+e 91 1 256 0 0 0
+e 120 2 256 0 0 0
+e 121 1 256 0 0 0

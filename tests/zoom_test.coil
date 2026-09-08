@@ -1,0 +1,39 @@
+(module atlas.tests.zoom)
+(import "atlas.ray" :as r)
+
+(defn check-zoom [(yaw f64) (pitch f64) (start f64) (finish f64)] (-> i64)
+  (let [target (r/v3 10.0 2.0 -5.0)
+        point (r/v3 15.0 7.0 -2.0)
+        before (r/orbit-camera target yaw pitch start)
+        pixel (r/GetWorldToScreenEx point before 1100 824)
+        offset
+          (r/v2 (- (cast f64 (load (field pixel x))) 550.0)
+                (- (cast f64 (load (field pixel y))) 412.0))
+        next (r/zoom-target target yaw pitch start finish offset 824.0)
+        after
+          (r/GetWorldToScreenEx point
+                                (r/orbit-camera next yaw pitch finish)
+                                1100
+                                824)]
+    (assert (< (r/fabs (- (cast f64 (load (field pixel x)))
+                          (cast f64 (load (field after x)))))
+               0.02))
+    (assert (< (r/fabs (- (cast f64 (load (field pixel y)))
+                          (cast f64 (load (field after y)))))
+               0.02))
+    (assert (< (r/fabs (- (cast f64 (load (field next y))) 2.0)) 0.000001))
+    0))
+
+(deftest zoom-keeps-off-center-elevated-point-under-cursor
+         (check-zoom 0.65 0.72 80.0 12.0)
+         (check-zoom -1.2 0.25 12.0 80.0)
+         (check-zoom 2.7 1.45 80.0 5.0)
+         (check-zoom 0.0 0.72 12.0 12.0))
+
+(deftest smoothed-zoom-steps-compose
+         (let [target (r/v3 10.0 2.0 -5.0)
+               offset (r/v2 240.0 -130.0)
+               direct (r/zoom-target target 0.65 0.72 80.0 12.0 offset 824.0)
+               mid (r/zoom-target target 0.65 0.72 80.0 40.0 offset 824.0)
+               stepped (r/zoom-target mid 0.65 0.72 40.0 12.0 offset 824.0)]
+           (assert (< (r/distance2 direct stepped) 0.000001))))

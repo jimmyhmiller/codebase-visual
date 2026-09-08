@@ -1,0 +1,150 @@
+(module atlas.tests.members)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.world" :as world)
+(import "atlas.view" :as view)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+
+(deftest coil-fields-preserve-generics-nested-signatures-and-lines
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut s)
+                                       "box.coil"
+                                       "(module demo)\n(defstruct Box :layout c [T]\n [(value T) ; field comment\n (children (slice (ptr T)))\n (callback (fn [T] (-> bool)))])")
+             (let [e (al/al-get (load (field s entities)) 0)
+                   details (load (field e details))
+                   child (al/al-get details 1)
+                   callback (al/al-get details 2)]
+               (assert (load (field e details-known)))
+               (assert-eq (al/al-len details) 3)
+               (assert-eq (load (field child name)) "children")
+               (assert-eq (load (field child signature)) "(slice (ptr T))")
+               (assert-eq (load (field child line)) 4)
+               (assert-eq (load (field callback signature))
+                          "(fn [T] (-> bool))")))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest fields-distinguish-empty-partial-and-unsupported
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut s)
+                                       "empty.coil"
+                                       "(defstruct Empty [])")
+             (analyzer/analyze-source! (mut s)
+                                       "partial.coil"
+                                       "(defstruct Broken [(ready i64) (pending (ptr")
+             (analyzer/analyze-source! (mut s)
+                                       "enum.coil"
+                                       "(defsum State (Ready) (Done))")
+             (let [empty (al/al-get (load (field s entities)) 0)
+                   partial (al/al-get (load (field s entities)) 1)
+                   unsupported (al/al-get (load (field s entities)) 2)]
+               (assert (load (field empty details-known)))
+               (assert-eq (al/al-len (load (field empty details))) 0)
+               (assert (not (load (field partial details-known))))
+               (assert-eq (al/al-len (load (field partial details))) 1)
+               (assert (not (load (field unsupported details-known))))
+               (assert-eq (al/al-len (load (field unsupported details))) 0)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest retained-fields-own-their-text-and-array
+         (let [(mut source-arena) (zeroed scratch/ScratchArena)
+               (mut retained-arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut source-arena) (alloc/malloc-allocator))
+           (scratch/scratch-init (mut retained-arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut source-arena))
+                 b (scratch/scratch-allocator (mut retained-arena))
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut s)
+                                       "owned.coil"
+                                       (m/copy-text a
+                                                    "(defstruct Owned [(payload (slice u8))])"))
+             (let [retained
+                     (m/copy-entity b (al/al-get (load (field s entities)) 0))]
+               (scratch/scratch-close! (mut source-arena))
+               (let [detail (al/al-get (load (field retained details)) 0)]
+                 (assert (load (field retained details-known)))
+                 (assert-eq (load (field detail name)) "payload")
+                 (assert-eq (load (field detail signature)) "(slice u8)"))))
+           (scratch/scratch-close! (mut retained-arena))))
+
+(deftest removed-ghost-keeps-observed-fields
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut before)
+                                       "old.coil"
+                                       "(defstruct Old [(id i64)])")
+             (world/reconcile! (mut before) (mut after))
+             (let [ghost (al/al-get (load (field after entities)) 0)
+                   detail (al/al-get (load (field ghost details)) 0)]
+               (assert-eq (load (field ghost state)) 3)
+               (assert (load (field ghost details-known)))
+               (assert-eq (load (field detail name)) "id")))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest member-reader-rejects-mixed-mismatches-and-ignores-quoted-delimiters
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 bad (analyzer/tokenize a "([)]" true)
+                 good (analyzer/tokenize a "(\")\" [i64])" true)]
+             (assert-eq (analyzer/expression-end bad 0 (al/al-len bad)) -1)
+             (assert-eq (analyzer/expression-end good 0 (al/al-len good))
+                        (al/al-len good)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest focused-inspector-retains-fields-and-scroll-across-zoom-levels
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut v) (zeroed view/View)]
+             (analyzer/analyze-source! (mut s)
+                                       "members.coil"
+                                       "(defstruct Pair [(left i64) (right i64)])")
+             (store! (field v zoom) 6.0)
+             (assert (view/member-mode? (mut v) (mut s)))
+             (assert (< (view/inspector-height-for (mut v) (mut s)) 920.001))
+             (assert (> (view/inspector-offset-for (mut v) (mut s) 700.0 9000.0)
+                        219.999))
+             (assert (< (view/inspector-offset-for (mut v) (mut s) 700.0 9000.0)
+                        220.001))
+             (store! (field v zoom) 12.0)
+             (assert (not (view/member-mode? (mut v) (mut s))))
+             (assert (< (view/inspector-offset-for (mut v) (mut s) 700.0 220.0)
+                        220.001))
+             (assert (> (view/inspector-offset-for (mut v) (mut s) 700.0 220.0) 219.999))
+             (store! (field v zoom) 6.0)
+             (store! (field v selected) -1)
+             (assert (not (view/member-mode? (mut v) (mut s)))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest member-reader-bounds-nesting-without-stack-overrun
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut tokens) (al/al-new [analyzer/Token] a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 257) (break 0) 0)
+               (al/al-push! (mut tokens)
+                            (analyzer/Token
+                              :text "("
+                              :line 1
+                              :start 0
+                              :end 1
+                              :quoted false))
+               (store! i (+ (load i) 1)))
+             (assert-eq (analyzer/expression-end (load tokens)
+                                                 0
+                                                 (al/al-len (load tokens)))
+                        -1))
+           (scratch/scratch-close! (mut arena))))

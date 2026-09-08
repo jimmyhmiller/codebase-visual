@@ -1,0 +1,82 @@
+(module atlas.tests.route-curve)
+(import "atlas.view" :as view)
+(import "atlas.ray" :as r)
+
+(defn point [(a r/Vector3) (b r/Vector3) (t f64) (module-route bool)] (-> r/Vector3)
+  (if module-route (view/path-point a b t) (view/reference-point a b t)))
+
+(deftest route-tessellation-stays-within-screen-error-budget
+         (let [(mut kind) 0]
+           (loop (if (= (load kind) 2) (break 0) 0)
+             (let [(mut distance) 2.0]
+               (loop (if (> (load distance) 1024.0) (break 0) 0)
+                 (let [a (r/v3 0.0 2.0 0.0)
+                       b
+                         (r/v3 (* (load distance) 0.6)
+                               2.0
+                               (* (load distance) 0.8))
+                       (mut zoom) 5.0]
+                   (loop (if (> (load zoom) 200.0) (break 0) 0)
+                     (let [sampling
+                             (view/route-sampling (load distance)
+                                                  (load zoom)
+                                                  824.0
+                                                  (= (load kind) 0))
+                           n (view/route-count sampling)
+                           (mut i) 0]
+                       (assert (>= n 3))
+                       (loop (if (>= (load i) n) (break 0) 0)
+                         (let [lo (view/route-parameter sampling (load i))
+                               hi (view/route-parameter sampling (+ (load i) 1))
+                               p (point a b lo (= (load kind) 0))
+                               q (point a b hi (= (load kind) 0))
+                               (mut sample) 1]
+                           (loop (if (>= (load sample) 8) (break 0) 0)
+                             (let [u (/ (cast f64 (load sample)) 8.0)
+                                   actual
+                                     (point a
+                                            b
+                                            (r/mix lo hi u)
+                                            (= (load kind) 0))
+                                   x
+                                     (- (cast f64 (load (field actual x)))
+                                        (r/mix (cast f64 (load (field p x)))
+                                               (cast f64 (load (field q x)))
+                                               u))
+                                   y
+                                     (- (cast f64 (load (field actual y)))
+                                        (r/mix (cast f64 (load (field p y)))
+                                               (cast f64 (load (field q y)))
+                                               u))
+                                   z
+                                     (- (cast f64 (load (field actual z)))
+                                        (r/mix (cast f64 (load (field p z)))
+                                               (cast f64 (load (field q z)))
+                                               u))
+                                   pixels
+                                     (* (/ 824.0 (load zoom))
+                                        (r/sqrt (+ (* x x) (+ (* y y) (* z z)))))]
+                               ;; Allow float32 vertex quantization beyond the 0.20 px analytic bound.
+                               (assert (< pixels 0.21)))
+                             (store! sample (+ (load sample) 1))))
+                         (store! i (+ (load i) 1))))
+                     (store! zoom (* (load zoom) 4.0))))
+                 (store! distance (* (load distance) 2.0))))
+             (store! kind (+ (load kind) 1)))))
+
+(deftest module-route-height-has-no-corner-at-clearance-join
+         (let [pi 3.141592653589793
+               a (r/v3 0.0 2.0 0.0)
+               b (r/v3 (/ pi (r/sin (* pi 0.125))) 2.0 0.0)
+               left (view/path-point a b 0.1249)
+               mid (view/path-point a b 0.125)
+               right (view/path-point a b 0.1251)
+               slope-left
+                 (/ (- (cast f64 (load (field mid y)))
+                       (cast f64 (load (field left y))))
+                    0.0001)
+               slope-right
+                 (/ (- (cast f64 (load (field right y)))
+                       (cast f64 (load (field mid y))))
+                    0.0001)]
+           (assert (< (r/fabs (- slope-left slope-right)) 0.05))))

@@ -1,0 +1,849 @@
+(module atlas.terrain)
+(import "atlas.ray" :as r)
+(import "atlas.model" :as m)
+(import "atlas.landform" :as land)
+(import "atlas.geography" :as geography)
+(import "atlas.spatial" :as spatial)
+(import "atlas.overview" :as overview)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(defstruct Vertex
+  [(p r/Vector3) (color r/Color) (normal r/Vector3) (uv r/Vector2)])
+
+(defstruct ChunkData
+  [(island m/Island)
+   (fine (al/ArrayList Vertex))
+   (coarse (al/ArrayList Vertex))
+   (water (al/ArrayList Vertex))])
+
+(defstruct Chunk
+  [(island m/Island) (fine r/Model) (coarse r/Model) (water r/Model)])
+
+(defstruct UploadStage [(chunks (al/ArrayList Chunk)) (next i64)])
+
+(defn new-upload-stage [] (-> UploadStage)
+  (UploadStage :chunks (al/al-new [Chunk] (alloc/malloc-allocator)) :next 0))
+
+;;; Render-thread upload budget: complete meshes are staged, but never become
+;;; visible until the entire immutable terrain package is ready to swap.
+(defn upload-step! [(stage (ptr UploadStage)) (data (al/ArrayList ChunkData))] (-> bool)
+  (let [started (r/GetTime)]
+    (loop (if (>= (load (field stage next)) (al/al-len data)) (break 0) 0)
+      (let [d (al/al-get data (load (field stage next)))]
+        (al/al-push! (field stage chunks)
+                     (Chunk
+                       :island (load (field d island))
+                       :fine (upload (load (field d fine)))
+                       :coarse (upload (load (field d coarse)))
+                       :water (upload (load (field d water))))))
+      (store! (field stage next) (+ (load (field stage next)) 1))
+      (if (>= (- (r/GetTime) started) 0.003) (break 0) 0))
+    (>= (load (field stage next)) (al/al-len data))))
+
+(defn take-upload! [(stage (ptr UploadStage))] (-> (al/ArrayList Chunk))
+  (let [result (load (field stage chunks))]
+    (store! stage (new-upload-stage))
+    result))
+
+(defn generate-chunks [(islands (al/ArrayList m/Island))
+                       (entities (al/ArrayList m/Entity))] (-> (al/ArrayList ChunkData))
+  (let [(mut chunks) (al/al-new [ChunkData] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len islands)) (break 0) 0)
+      (al/al-push! (mut chunks)
+                   (ChunkData
+                     :island (al/al-get islands (load i))
+                     :water
+                       (generate-field-water-range islands
+                                                   (load i)
+                                                   (+ (load i) 1))
+                     :fine
+                       (generate-range islands
+                                       entities
+                                       false
+                                       (load i)
+                                       (+ (load i) 1)
+                                       false)
+                     :coarse
+                       (generate-range islands
+                                       entities
+                                       false
+                                       (load i)
+                                       (+ (load i) 1)
+                                       true)))
+      (store! i (+ (load i) 1)))
+    (load chunks)))
+
+(defn release-chunks! [(chunks (ptr (al/ArrayList ChunkData)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load chunks))) (break 0) 0)
+      (let [chunk (al/al-elem [ChunkData] (mut chunks) (load i))]
+        (al/al-free! (field chunk fine))
+        (al/al-free! (field chunk water))
+        (al/al-free! (field chunk coarse)))
+      (store! i (+ (load i) 1)))
+    (al/al-free! (mut chunks))
+    0))
+
+(defn upload-chunks [(data (al/ArrayList ChunkData))] (-> (al/ArrayList Chunk))
+  (let [(mut chunks) (al/al-new [Chunk] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len data)) (break 0) 0)
+      (let [d (al/al-get data (load i))]
+        (al/al-push! (mut chunks)
+                     (Chunk
+                       :island (load (field d island))
+                       :water (upload (load (field d water)))
+                       :fine (upload (load (field d fine)))
+                       :coarse (upload (load (field d coarse))))))
+      (store! i (+ (load i) 1)))
+    (load chunks)))
+
+(defn unload-chunks! [(chunks (ptr (al/ArrayList Chunk)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (load chunks))) (break 0) 0)
+      (let [chunk (al/al-get (load chunks) (load i))]
+        (r/UnloadModel (load (field chunk fine)))
+        (r/UnloadModel (load (field chunk water)))
+        (r/UnloadModel (load (field chunk coarse))))
+      (store! i (+ (load i) 1)))
+    (al/al-free! (mut chunks))
+    0))
+
+(defn bake-chunks [(islands (al/ArrayList m/Island))
+                   (entities (al/ArrayList m/Entity))] (-> (al/ArrayList Chunk))
+  (let [(mut data) (generate-chunks islands entities)
+        chunks (upload-chunks (load data))]
+    (release-chunks! (mut data))
+    chunks))
+
+(defn append! [(vertices (ptr (al/ArrayList Vertex))) (p r/Vector3) (c r/Color)] (-> i64)
+  (al/al-push! (mut vertices)
+               (Vertex
+                 :p p
+                 :color c
+                 :normal (r/v3 0.0 0.0 0.0)
+                 :uv (r/v2 0.0 0.0))))
+
+(defn append-normal! [(vertices (ptr (al/ArrayList Vertex)))
+                      (p r/Vector3)
+                      (n r/Vector3)
+                      (c r/Color)] (-> i64)
+  (al/al-push! (mut vertices)
+               (Vertex
+                 :p p
+                 :color c
+                 :normal n
+                 :uv (r/v2 0.0 0.0))))
+
+;;; Shelf UVs carry the radial coastline coordinate, not world distance or depth.
+;;; The second component distinguishes the shelf from the plain ocean plane.
+(defn append-water! [(vertices (ptr (al/ArrayList Vertex)))
+                     (p r/Vector3)
+                     (c r/Color)
+                     (scale f64)] (-> i64)
+  (al/al-push! (mut vertices)
+               (Vertex
+                 :p p
+                 :color c
+                 :normal (r/v3 0.0 1.0 0.0)
+                 :uv (r/v2 scale 1.0))))
+
+(defn grid-normal [(points (al/ArrayList r/Vector3))
+                   (ring i64)
+                   (i i64)
+                   (rings i64)
+                   (segments i64)] (-> r/Vector3)
+  (if (= ring 0)
+      (r/v3 0.0 1.0 0.0)
+      (let [a (al/al-get points (+ (* (- ring 1) segments) i))
+            b
+              (al/al-get points
+                         (+ (* (if (< ring rings) (+ ring 1) ring) segments) i))
+            c
+              (al/al-get points
+                         (+ (* ring segments) (% (+ i (- segments 1)) segments)))
+            d (al/al-get points (+ (* ring segments) (% (+ i 1) segments)))
+            ux (- (cast f64 (load (field d x))) (cast f64 (load (field c x))))
+            uy (- (cast f64 (load (field d y))) (cast f64 (load (field c y))))
+            uz (- (cast f64 (load (field d z))) (cast f64 (load (field c z))))
+            vx (- (cast f64 (load (field b x))) (cast f64 (load (field a x))))
+            vy (- (cast f64 (load (field b y))) (cast f64 (load (field a y))))
+            vz (- (cast f64 (load (field b z))) (cast f64 (load (field a z))))
+            nx (- (* uy vz) (* uz vy))
+            ny (- (* uz vx) (* ux vz))
+            nz (- (* ux vy) (* uy vx))
+            length (r/sqrt (+ (* nx nx) (+ (* ny ny) (* nz nz))))]
+        (if (> length 0.000001)
+            (r/v3 (/ nx length) (/ ny length) (/ nz length))
+            (r/v3 0.0 1.0 0.0)))))
+
+(defn tri! [(vs (ptr (al/ArrayList Vertex)))
+            (a r/Vector3)
+            (b r/Vector3)
+            (c r/Vector3)
+            (color r/Color)] (-> i64)
+  (append! vs a color)
+  (append! vs b color)
+  (append! vs c color))
+
+;;; A broad fractured crown and displaced shoulders replace the old pointed
+;;; pyramid. Every ring stays within the supplied radius, preserving clearance.
+(defn rock-point [(p r/Vector3)
+                  (radius f64)
+                  (height f64)
+                  (seed f64)
+                  (ring i64)
+                  (side i64)] (-> r/Vector3)
+  (let [i (cast f64 (% side 8))
+        angle
+          (+ seed
+             (+ (* i 0.7853981633974483)
+                (* 0.085 (r/sin (+ seed (* i 2.7))))))
+        rough (+ 0.84 (* 0.14 (r/sin (+ (* angle 3.0) seed))))
+        width
+          (* radius
+             (* rough
+                (cond (= ring 0) 0.88
+                      (= ring 1) 1.0
+                      (= ring 2) 0.91
+                      :else 0.64)))
+        elevation
+          (cond (= ring 0) -0.08
+                (= ring 1) (* height (+ 0.23 (* 0.065 (r/sin (+ angle seed)))))
+                (= ring 2)
+                  (* height (+ 0.60 (* 0.08 (r/sin (+ (* angle 2.0) seed)))))
+                :else
+                  (* height
+                     (+ 0.83 (* 0.055 (r/sin (+ (* angle 2.0) (* seed 0.7)))))))]
+    (r/v3 (+ (cast f64 (load (field p x))) (* width (r/cos angle)))
+          (+ (cast f64 (load (field p y))) elevation)
+          (+ (cast f64 (load (field p z))) (* width (r/sin angle))))))
+
+;;; Offshore outcrops cross the surface instead of resting their flat bottom
+;;; cap on it. A height-relative embed keeps even the smallest crown exposed.
+(defn offshore-anchor [(p r/Vector3) (height f64) (water-height f64)] (-> r/Vector3)
+  (r/v3 (cast f64 (load (field p x)))
+        (- water-height (* height 0.18))
+        (cast f64 (load (field p z)))))
+
+(defn rock! [(vs (ptr (al/ArrayList Vertex)))
+             (p r/Vector3)
+             (radius f64)
+             (height f64)
+             (seed f64)] (-> i64)
+  (let [(mut points) (zeroed (array r/Vector3 32))
+        (mut i) 0
+        (mut band) 0
+        base-color
+          (r/shade (r/rgba 94 98 86 255) (+ 0.88 (* 0.12 (r/sin seed))))
+        crown
+          (r/v3 (cast f64 (load (field p x)))
+                (+ (cast f64 (load (field p y)))
+                   (* height (+ 0.86 (* 0.03 (r/sin seed)))))
+                (cast f64 (load (field p z))))
+        bottom
+          (r/v3 (cast f64 (load (field p x)))
+                (- (cast f64 (load (field p y))) 0.08)
+                (cast f64 (load (field p z))))]
+    (loop (if (>= (load i) 32) (break 0) 0)
+      (store! (index points (load i))
+              (rock-point p radius height seed (/ (load i) 8) (% (load i) 8)))
+      (store! i (+ (load i) 1)))
+    (loop (if (>= (load band) 3) (break 0) 0)
+      (store! i 0)
+      (loop (if (>= (load i) 8) (break 0) 0)
+        (let [j (% (+ (load i) 1) 8)
+              a (load (index points (+ (* (load band) 8) (load i))))
+              b (load (index points (+ (* (load band) 8) j)))
+              c (load (index points (+ (* (+ (load band) 1) 8) (load i))))
+              d (load (index points (+ (* (+ (load band) 1) 8) j)))
+              color
+                (r/shade base-color
+                         (+ 0.80
+                            (+ (* (cast f64 (load band)) 0.10)
+                               (* 0.09
+                                  (r/sin (+ seed (* (cast f64 (load i)) 2.1)))))))]
+          (tri! vs a c b color)
+          (tri! vs b c d color))
+        (store! i (+ (load i) 1)))
+      (store! band (+ (load band) 1)))
+    (store! i 0)
+    (loop (if (>= (load i) 8) (break 0) 0)
+      (let [j (% (+ (load i) 1) 8)]
+        (tri! vs
+              (load (index points (+ 24 (load i))))
+              crown
+              (load (index points (+ 24 j)))
+              (r/shade base-color 1.15))
+        (tri! vs
+              bottom
+              (load (index points (load i)))
+              (load (index points j))
+              (r/shade base-color 0.68)))
+      (store! i (+ (load i) 1)))
+    0))
+
+(defstruct Outcrop
+  [(angle f64) (scale f64) (radius f64) (height f64) (seed f64)])
+
+;;; Uneven groups span several terrace levels; a world-space size cap avoids
+;;; giant evenly spaced boulders when a live module grows substantially.
+(defn outcrop-site [(seed f64) (island-radius f64) (index i64)] (-> Outcrop)
+  (let [group (cast f64 (/ index 9))
+        member (cast f64 (% index 9))
+        center
+          (+ seed
+             (+ (* group 2.399963229728653)
+                (* 0.9 (- (land/hash-cell seed group 7.0) 0.5))))
+        spread (+ 0.18 (* 0.28 (land/hash-cell seed group 11.0)))
+        jitter (land/hash-cell seed member (+ group 23.0))
+        size (land/hash-cell seed member (+ group 37.0))
+        radius (if (< (* island-radius 0.065) 1.1) (* island-radius 0.065) 1.1)]
+    (Outcrop
+      :angle (+ center (* spread (- (/ (+ member jitter) 9.0) 0.5)))
+      :scale (+ 0.955 (* 0.155 (land/hash-cell seed member (+ group 43.0))))
+      :radius (* radius (+ 0.55 (* size 0.45)))
+      :height (+ 0.30 (* 0.85 (land/hash-cell seed member (+ group 59.0))))
+      :seed (+ seed (+ (* group 3.1) (* member 0.73))))))
+
+(defn ring-point [(island m/Island) (angle f64) (scale f64) (height f64)] (-> r/Vector3)
+  (let [seed (* (cast f64 (% (load (field island seed)) 997)) 0.019)
+        rough (land/coast seed angle scale)
+        radius (* (load (field island radius)) (* scale rough))
+        p (load (field island position))]
+    (r/v3 (+ (cast f64 (load (field p x))) (* radius (r/cos angle)))
+          height
+          (+ (cast f64 (load (field p z))) (* radius (r/sin angle))))))
+
+;;; Periodic piecewise-linear joints, in world-sized cells rather than one
+;;; random value per mesh vertex. Adjacent faces share exact joint samples.
+(defn fracture-noise [(seed f64) (angle f64) (count i64) (salt f64)] (-> f64)
+  (let [turn (/ angle 6.283185307179586)
+        phase (* (- turn (r/floor turn)) (cast f64 count))
+        cell (cast i64 (r/floor phase))
+        t (- phase (r/floor phase))
+        a (land/hash-cell seed (cast f64 (% cell count)) salt)
+        b (land/hash-cell seed (cast f64 (% (+ cell 1) count)) salt)]
+    (- (* 2.0 (+ a (* (- b a) t))) 1.0)))
+
+(defn fracture-count [(radius f64)] (-> i64)
+  (cast i64 (r/clamp (r/floor (* radius 5.0)) 24.0 256.0)))
+
+;;; Warp the bed edges together, with fixed waterline and plateau endpoints.
+;;; Maximum displacement derivative is below 0.22, preserving radial order.
+(defn stratum-scale [(seed f64) (angle f64) (scale f64) (radius f64)] (-> f64)
+  (let [t
+          (r/clamp (/ (- scale (land/plateau-scale))
+                      (- (land/coast-scale) (land/plateau-scale)))
+                   0.0
+                   1.0)
+        joint (fracture-noise seed angle (fracture-count radius) 97.0)
+        amplitude (r/clamp (/ 0.23 radius) 0.0 0.016)]
+    (+ scale (* amplitude (* joint (r/sin (* t 3.141592653589793)))))))
+
+(defn stratum-point [(island m/Island) (angle f64) (scale f64) (height f64)] (-> r/Vector3)
+  (let [seed (* (cast f64 (% (load (field island seed)) 997)) 0.019)
+        count (fracture-count (load (field island radius)))
+        t (r/clamp (/ (+ height 0.38) 2.32) 0.0 1.0)
+        joint (fracture-noise seed angle count 71.0)
+        relief (* 0.085 (* joint (r/sin (* t 3.141592653589793))))]
+    (ring-point island
+                angle
+                (stratum-scale seed angle scale (load (field island radius)))
+                (+ (land/stratum-height seed angle height) relief))))
+
+;;; Two interior courses break a ruled cliff into chipped, hard-normal faces.
+;;; Radial offsets taper to zero at both shared edges. The offset is bounded by
+;;; the bed width, so the entire face remains between its original two rings.
+(defn cliff-point [(island m/Island) (angle f64) (layer i64) (t f64)] (-> r/Vector3)
+  (let [seed (* (cast f64 (% (load (field island seed)) 997)) 0.019)
+        radius (load (field island radius))
+        l (cast f64 layer)
+        outer (- (land/coast-scale) (* l (land/stratum-width)))
+        width (land/cliff-width)
+        y (+ -0.38 (* l 0.34))
+        joint
+          (fracture-noise seed
+                          (+ angle (* l 0.017))
+                          (fracture-count radius)
+                          113.0)
+        envelope (* 4.0 (* t (- 1.0 t)))
+        amplitude (r/clamp (/ 0.12 radius) 0.0 (* width 0.20))
+        scale (+ (- outer (* width t)) (* amplitude (* envelope joint)))]
+    (stratum-point island angle scale (+ y (* t 0.28)))))
+
+(defn plateau-point [(island m/Island)
+                     (angle f64)
+                     (scale f64)
+                     (sites (al/ArrayList r/Vector3))] (-> r/Vector3)
+  (let [p (ring-point island angle scale 1.94)]
+    (plateau-height-point island p scale (land/foundation-mask p sites))))
+
+(defn indexed-plateau-point [(island m/Island)
+                             (angle f64)
+                             (scale f64)
+                             (sites (al/ArrayList r/Vector3))] (-> r/Vector3)
+  (indexed-plateau-landmarks island angle scale sites (zeroed (array bool 7))))
+
+(defn landmark-mask [(p r/Vector3) (island m/Island) (kinds (array bool 7))] (-> f64)
+  ;; Existing flattening includes a 0.50-unit mesh margin outside a 1.05 disk.
+  (land/mask-from-clearance (+ 1.05 (overview/clearance p island kinds))))
+
+(defn indexed-plateau-landmarks [(island m/Island)
+                                 (angle f64)
+                                 (scale f64)
+                                 (sites (al/ArrayList r/Vector3))
+                                 (kinds (array bool 7))] (-> r/Vector3)
+  (let [p (ring-point island angle scale 1.94)]
+    (plateau-height-point island
+                          p
+                          scale
+                          (r/clamp (land/mask-from-clearance (r/sqrt (spatial/nearest-squared sites
+                                                                                              p
+                                                                                              5.29)))
+                                   0.0
+                                   (landmark-mask p island kinds)))))
+
+(defn plateau-height-point [(island m/Island)
+                            (point r/Vector3)
+                            (scale f64)
+                            (mask f64)] (-> r/Vector3)
+  (let [(mut p) (load point)
+        center (load (field island position))
+        seed (* (cast f64 (% (load (field island seed)) 997)) 0.019)
+        x (- (cast f64 (load (field p x))) (cast f64 (load (field center x))))
+        z (- (cast f64 (load (field p z))) (cast f64 (load (field center z))))]
+    (store! (field p y)
+            (cast f32
+                  (land/plateau-height seed
+                                       x
+                                       z
+                                       scale
+                                       (* mask
+                                          (land/mask-from-clearance (- (r/sqrt (+ (* x
+                                                                                     x)
+                                                                                  (* z
+                                                                                     z)))
+                                                                       4.45))))))
+    (load p)))
+
+(defn plateau! [(vs (ptr (al/ArrayList Vertex)))
+                (island m/Island)
+                (sites (al/ArrayList r/Vector3))
+                (segments i64)
+                (kinds (array bool 7))] (-> i64)
+  (plateau-detail! vs island sites segments kinds 0.35))
+
+(defn plateau-detail! [(vs (ptr (al/ArrayList Vertex)))
+                       (island m/Island)
+                       (sites (al/ArrayList r/Vector3))
+                       (segments i64)
+                       (kinds (array bool 7))
+                       (spacing f64)] (-> i64)
+  (let [rings
+          (cast i64
+                (r/floor (+ 1.0
+                            (/ (* (land/plateau-scale)
+                                  (load (field island radius)))
+                               spacing))))
+        (mut ring) 0
+        (mut points) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+        (mut smooth-normals) (al/al-new [r/Vector3] (alloc/malloc-allocator))]
+    ;; Cache shared vertices so neighboring cells have exactly matching edges.
+    (loop (if (> (load ring) rings) (break 0) 0)
+      (let [(mut i) 0
+            scale
+              (* (land/plateau-scale)
+                 (/ (cast f64 (load ring)) (cast f64 rings)))]
+        (loop (if (>= (load i) segments) (break 0) 0)
+          (al/al-push! (mut points)
+                       (indexed-plateau-landmarks island
+                                                  (* (cast f64 (load i))
+                                                     (/ 6.283185307179586
+                                                        (cast f64 segments)))
+                                                  scale
+                                                  sites
+                                                  kinds))
+          (store! i (+ (load i) 1))))
+      (store! ring (+ (load ring) 1)))
+    (store! ring 0)
+    (loop (if (> (load ring) rings) (break 0) 0)
+      (let [(mut i) 0]
+        (loop (if (>= (load i) segments) (break 0) 0)
+          (al/al-push! (mut smooth-normals)
+                       (grid-normal (load points)
+                                    (load ring)
+                                    (load i)
+                                    rings
+                                    segments))
+          (store! i (+ (load i) 1))))
+      (store! ring (+ (load ring) 1)))
+    (store! ring 0)
+    (loop (if (>= (load ring) rings) (break 0) 0)
+      (let [(mut i) 0]
+        (loop (if (>= (load i) segments) (break 0) 0)
+          (let [j (% (+ (load i) 1) segments)
+                inner (* (load ring) segments)
+                outer (+ inner segments)
+                a (al/al-get (load points) (+ inner (load i)))
+                b (al/al-get (load points) (+ outer (load i)))
+                c (al/al-get (load points) (+ outer j))
+                d (al/al-get (load points) (+ inner j))
+                na (al/al-get (load smooth-normals) (+ inner (load i)))
+                nb (al/al-get (load smooth-normals) (+ outer (load i)))
+                nc (al/al-get (load smooth-normals) (+ outer j))
+                nd (al/al-get (load smooth-normals) (+ inner j))
+                height
+                  (* 0.5
+                     (+ (cast f64 (load (field b y)))
+                        (cast f64 (load (field c y)))))
+                color
+                  (r/shade (r/rgba 52 61 47 255)
+                           (+ 0.91 (* 0.22 (- height 1.94))))]
+            (append-normal! vs a na color)
+            (append-normal! vs c nc color)
+            (append-normal! vs b nb color)
+            (if (> (load ring) 0)
+                (do
+                  (append-normal! vs a na color)
+                  (append-normal! vs d nd color)
+                  (append-normal! vs c nc color))
+                0))
+          (store! i (+ (load i) 1))))
+      (store! ring (+ (load ring) 1)))
+    (al/al-free! (mut points))
+    (al/al-free! (mut smooth-normals))
+    0))
+
+(defn upload [(vertices (al/ArrayList Vertex))] (-> r/Model)
+  (let [n (al/al-len vertices)
+        (mut mesh) (zeroed r/Mesh)
+        points (cast (ptr f32) (r/MemAlloc (cast u32 (* n 12))))
+        colors (cast (ptr u8) (r/MemAlloc (cast u32 (* n 4))))
+        normals (cast (ptr f32) (r/MemAlloc (cast u32 (* n 12))))
+        texcoords (cast (ptr f32) (r/MemAlloc (cast u32 (* n 8))))
+        (mut i) 0]
+    (store! (field mesh vertexCount) (cast i32 n))
+    (store! (field mesh triangleCount) (cast i32 (/ n 3)))
+    (store! (field mesh vertices) points)
+    (store! (field mesh colors) colors)
+    (store! (field mesh normals) normals)
+    (store! (field mesh texcoords) texcoords)
+    (loop (if (>= (load i) n) (break 0) 0)
+      (let [v (al/al-get vertices (load i))
+            p (load (field v p))
+            c (load (field v color))
+            j (* (load i) 3)
+            k (* (load i) 4)]
+        (store! (index texcoords (* (load i) 2)) (load (field (field v uv) x)))
+        (store! (index texcoords (+ (* (load i) 2) 1))
+                (load (field (field v uv) y)))
+        (store! (index points j) (load (field p x)))
+        (store! (index points (+ j 1)) (load (field p y)))
+        (store! (index points (+ j 2)) (load (field p z)))
+        (store! (index colors k) (load (field c r)))
+        (store! (index colors (+ k 1)) (load (field c g)))
+        (store! (index colors (+ k 2)) (load (field c b)))
+        (store! (index colors (+ k 3)) (load (field c a)))
+        (let [base (- (load i) (% (load i) 3))
+              va (al/al-get vertices base)
+              vb (al/al-get vertices (+ base 1))
+              vc (al/al-get vertices (+ base 2))
+              pa (load (field va p))
+              pb (load (field vb p))
+              pc (load (field vc p))
+              ux
+                (- (cast f64 (load (field pb x)))
+                   (cast f64 (load (field pa x))))
+              uy
+                (- (cast f64 (load (field pb y)))
+                   (cast f64 (load (field pa y))))
+              uz
+                (- (cast f64 (load (field pb z)))
+                   (cast f64 (load (field pa z))))
+              vx
+                (- (cast f64 (load (field pc x)))
+                   (cast f64 (load (field pa x))))
+              vy
+                (- (cast f64 (load (field pc y)))
+                   (cast f64 (load (field pa y))))
+              vz
+                (- (cast f64 (load (field pc z)))
+                   (cast f64 (load (field pa z))))
+              nx (- (* uy vz) (* uz vy))
+              ny (- (* uz vx) (* ux vz))
+              nz (- (* ux vy) (* uy vx))
+              length (r/sqrt (+ 0.000001 (+ (* nx nx) (+ (* ny ny) (* nz nz)))))]
+          (store! (index normals j) (cast f32 (/ nx length)))
+          (store! (index normals (+ j 1)) (cast f32 (/ ny length)))
+          (store! (index normals (+ j 2)) (cast f32 (/ nz length))))
+        (let [smooth (load (field v normal))
+              sx (cast f64 (load (field smooth x)))
+              sy (cast f64 (load (field smooth y)))
+              sz (cast f64 (load (field smooth z)))]
+          (if (> (+ (* sx sx) (+ (* sy sy) (* sz sz))) 0.5)
+              (do
+                (store! (index normals j) (load (field smooth x)))
+                (store! (index normals (+ j 1)) (load (field smooth y)))
+                (store! (index normals (+ j 2)) (load (field smooth z))))
+              0)))
+      (store! i (+ (load i) 1)))
+    (r/UploadMesh (mut mesh) (cast u8 0))
+    (r/LoadModelFromMesh (load mesh))))
+
+;;; Each stratum has a horizontal eroded terrace and an independently lit cliff.
+;;; The baked mesh is immutable; history updates only buildings and illumination.
+(defn generate [(islands (al/ArrayList m/Island))
+                (entities (al/ArrayList m/Entity))] (-> (al/ArrayList Vertex))
+  (generate-with-landmarks islands entities false))
+
+(defn generate-with-landmarks [(islands (al/ArrayList m/Island))
+                               (entities (al/ArrayList m/Entity))
+                               (landmarks bool)] (-> (al/ArrayList Vertex))
+  (generate-range islands entities landmarks 0 (al/al-len islands) false))
+
+;;; A regular heightfield, not radial rings. Fine/coarse meshes sample the same
+;;; world-space function and foundation constraints. Entirely submerged cells
+;;; are culled; the ocean clips all remaining coastal triangles at sea level.
+(defn field-grid [(island m/Island)
+                  (sites (al/ArrayList r/Vector3))
+                  (cells i64)] (-> (al/ArrayList Vertex))
+  (field-grid-with-landmarks island sites cells (zeroed (array bool 7))))
+
+(defn field-grid-with-landmarks [(island m/Island)
+                                 (sites (al/ArrayList r/Vector3))
+                                 (cells i64)
+                                 (kinds (array bool 7))] (-> (al/ArrayList Vertex))
+  (let [(mut grid) (al/al-new [Vertex] (alloc/malloc-allocator))
+        extent (* (land/main-coast-bound) (load (field island radius)))
+        step (/ (* 2.0 extent) (cast f64 cells))
+        center (load (field island position))
+        (mut z) 0]
+    (loop (if (> (load z) cells) (break 0) 0)
+      (let [(mut x) 0]
+        (loop (if (> (load x) cells) (break 0) 0)
+          (let [wx
+                  (+ (cast f64 (load (field center x)))
+                     (- (* step (cast f64 (load x))) extent))
+                wz
+                  (+ (cast f64 (load (field center z)))
+                     (- (* step (cast f64 (load z))) extent))
+                clearance
+                  (r/sqrt (spatial/nearest-squared sites (r/v3 wx 0.0 wz) 64.0))
+                landmark (overview/clearance (r/v3 wx 0.0 wz) island kinds)
+                height
+                  (r/mix 1.94
+                         (geography/elevation island wx wz clearance)
+                         (geography/smooth 2.9 5.0 landmark))]
+            (append! (mut grid) (r/v3 wx height wz) (r/rgba 255 255 255 255)))
+          (store! x (+ (load x) 1))))
+      (store! z (+ (load z) 1)))
+    (store! z 0)
+    (loop (if (> (load z) cells) (break 0) 0)
+      (let [(mut x) 0]
+        (loop (if (> (load x) cells) (break 0) 0)
+          (let [left (if (> (load x) 0) (- (load x) 1) 0)
+                right (if (< (load x) cells) (+ (load x) 1) cells)
+                up (if (> (load z) 0) (- (load z) 1) 0)
+                down (if (< (load z) cells) (+ (load z) 1) cells)
+                a (al/al-get (load grid) (+ (* (load z) (+ cells 1)) left))
+                b (al/al-get (load grid) (+ (* (load z) (+ cells 1)) right))
+                c (al/al-get (load grid) (+ (* up (+ cells 1)) (load x)))
+                d (al/al-get (load grid) (+ (* down (+ cells 1)) (load x)))
+                dx
+                  (/ (- (cast f64 (load (field (field b p) y)))
+                        (cast f64 (load (field (field a p) y))))
+                     (* step (cast f64 (- right left))))
+                dz
+                  (/ (- (cast f64 (load (field (field d p) y)))
+                        (cast f64 (load (field (field c p) y))))
+                     (* step (cast f64 (- down up))))
+                length (r/sqrt (+ 1.0 (+ (* dx dx) (* dz dz))))
+                v
+                  (al/al-elem [Vertex]
+                              (mut grid)
+                              (+ (* (load z) (+ cells 1)) (load x)))
+                p (load (field v p))]
+            (store! (field v normal)
+                    (r/v3 (/ (- 0.0 dx) length)
+                          (/ 1.0 length)
+                          (/ (- 0.0 dz) length)))
+            (store! (field v color)
+                    (geography/color (cast f64 (load (field p x)))
+                                     (cast f64 (load (field p z)))
+                                     (cast f64 (load (field p y)))
+                                     (r/sqrt (+ (* dx dx) (* dz dz))))))
+          (store! x (+ (load x) 1))))
+      (store! z (+ (load z) 1)))
+    (load grid)))
+
+(defn field-triangle! [(out (ptr (al/ArrayList Vertex)))
+                       (a Vertex)
+                       (b Vertex)
+                       (c Vertex)] (-> i64)
+  (if (or (> (load (field (field a p) y)) (cast f32 -0.50))
+          (> (load (field (field b p) y)) (cast f32 -0.50))
+          (> (load (field (field c p) y)) (cast f32 -0.50)))
+      (do (al/al-push! out a) (al/al-push! out b) (al/al-push! out c))
+      0))
+
+(defn generate-range [(islands (al/ArrayList m/Island))
+                      (entities (al/ArrayList m/Entity))
+                      (landmarks bool)
+                      (first i64)
+                      (end i64)
+                      (coarse bool)] (-> (al/ArrayList Vertex))
+  (let [(mut out) (al/al-new [Vertex] (alloc/malloc-allocator))
+        (mut i) first]
+    (loop (if (>= (load i) end) (break 0) 0)
+      (let [island (al/al-get islands (load i))
+            cells
+              (cast i64
+                    (r/ceil (/ (* 2.0
+                                  (* (land/main-coast-bound)
+                                     (load (field island radius))))
+                               (if coarse 1.65 0.55))))
+            (mut sites) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+            (mut kinds) (zeroed (array bool 7))
+            (mut e) 0]
+        (loop (if (>= (load e) (al/al-len entities)) (break 0) 0)
+          (let [entity (al/al-get entities (load e))]
+            (if (= (load (field entity island)) (load i))
+                (do
+                  (al/al-push! (mut sites) (load (field entity position)))
+                  (if (and landmarks
+                           (>= (load (field entity kind)) 0)
+                           (< (load (field entity kind)) 7))
+                      (store! (index kinds (load (field entity kind))) true)
+                      0))
+                0))
+          (store! e (+ (load e) 1)))
+        (let [(mut index) (spatial/build (load sites) (alloc/malloc-allocator))
+              (mut grid)
+                (field-grid-with-landmarks island
+                                           (load index)
+                                           cells
+                                           (load kinds))
+              (mut z) 0]
+          (loop (if (>= (load z) cells) (break 0) 0)
+            (let [(mut x) 0]
+              (loop (if (>= (load x) cells) (break 0) 0)
+                (let [at (+ (* (load z) (+ cells 1)) (load x))
+                      a (al/al-get (load grid) at)
+                      b (al/al-get (load grid) (+ at 1))
+                      c (al/al-get (load grid) (+ at (+ cells 1)))
+                      d (al/al-get (load grid) (+ at (+ cells 2)))]
+                  (field-triangle! (mut out) a c b)
+                  (field-triangle! (mut out) b c d))
+                (store! x (+ (load x) 1))))
+            (store! z (+ (load z) 1)))
+          (al/al-free! (mut grid))
+          (al/al-free! (mut index)))
+        (al/al-free! (mut sites)))
+      (store! i (+ (load i) 1)))
+    (load out)))
+
+;;; Only this wrapper and upload touch the graphics context. generate is pure
+;;; CPU geometry and returns an owned vertex array, releasable after upload.
+(defn bake [(islands (al/ArrayList m/Island))
+            (entities (al/ArrayList m/Entity))] (-> r/Model)
+  (let [started (r/GetTime)
+        (mut vs) (generate islands entities)]
+    (let [generated (r/GetTime)
+          model (upload (load vs))
+          finished (r/GetTime)]
+      (println "Terrain mesh: {} triangles, {} ms total ({} ms geometry, {} ms mesh preparation/upload)"
+               (/ (al/al-len (load vs)) 3)
+               (* 1000.0 (- finished started))
+               (* 1000.0 (- generated started))
+               (* 1000.0 (- finished generated)))
+      (al/al-free! (mut vs))
+      model)))
+
+;;; CPU-only coastal shelf, rebuilt with terrain rather than every frame.
+(defn water-segments [(radius f64)] (-> i64)
+  (let [segments (land/coast-segments (* radius 1.60))]
+    (if (> segments 192) segments 192)))
+
+(defn generate-water [(islands (al/ArrayList m/Island))] (-> (al/ArrayList Vertex))
+  (generate-field-water-range islands 0 (al/al-len islands)))
+
+(defn shelf-vertex [(island m/Island) (x f64) (z f64)] (-> Vertex)
+  (let [p (load (field island position))
+        radius (load (field island radius))
+        dx (- x (cast f64 (load (field p x))))
+        dz (- z (cast f64 (load (field p z))))
+        angle
+          (geography/heading (geography/ridge-seed (load (field island name))))
+        u (+ (* dx (r/cos angle)) (* dz (r/sin angle)))
+        v (- (* dz (r/cos angle)) (* dx (r/sin angle)))
+        distance (/ (r/sqrt (+ (* u u) (* 1.5 (* v v)))) radius)
+        bound (/ (r/sqrt (+ (* dx dx) (* dz dz))) radius)
+        n (geography/regional x z)
+        depth (+ distance (* 0.45 (- 0.5 n)))
+        influence
+          (* (- 1.0 (geography/smooth 0.55 2.1 depth))
+             (- 1.0 (geography/smooth 1.80 2.10 bound)))]
+    (Vertex
+      :p (r/v3 x -0.46 z)
+      :normal (r/v3 0.0 1.0 0.0)
+      :color
+        (r/rgba (+ 22 (cast i64 (* n 10.0)))
+                (+ 65 (cast i64 (* n 24.0)))
+                (+ 72 (cast i64 (* n 24.0)))
+                (cast i64 (* 150.0 influence)))
+      :uv (r/v2 depth 2.0))))
+
+;;; Overlapping translucent shelf influences blend into shared shallow water.
+;;; Their colors and channels sample the same regional field. No concentric
+;;; island rings, depth writes, or per-frame terrain reconstruction are needed.
+(defn generate-field-water-range [(islands (al/ArrayList m/Island))
+                                  (first i64)
+                                  (end i64)] (-> (al/ArrayList Vertex))
+  (let [(mut out) (al/al-new [Vertex] (alloc/malloc-allocator))
+        (mut i) first]
+    (loop (if (>= (load i) end) (break 0) 0)
+      (let [island (al/al-get islands (load i))
+            center (load (field island position))
+            extent (* 2.10 (load (field island radius)))
+            cells (cast i64 (r/ceil (/ (* 2.0 extent) 2.0)))
+            step (/ (* 2.0 extent) (cast f64 cells))
+            (mut z) 0]
+        (loop (if (>= (load z) cells) (break 0) 0)
+          (let [(mut x) 0]
+            (loop (if (>= (load x) cells) (break 0) 0)
+              (let [wx
+                      (+ (cast f64 (load (field center x)))
+                         (- (* step (cast f64 (load x))) extent))
+                    wz
+                      (+ (cast f64 (load (field center z)))
+                         (- (* step (cast f64 (load z))) extent))
+                    a (shelf-vertex island wx wz)
+                    b (shelf-vertex island (+ wx step) wz)
+                    c (shelf-vertex island wx (+ wz step))
+                    d (shelf-vertex island (+ wx step) (+ wz step))]
+                (if (> (+ (cast i64 (load (field (field a color) a)))
+                          (+ (cast i64 (load (field (field b color) a)))
+                             (+ (cast i64 (load (field (field c color) a)))
+                                (cast i64 (load (field (field d color) a))))))
+                       0)
+                    (do
+                      (al/al-push! (mut out) a)
+                      (al/al-push! (mut out) c)
+                      (al/al-push! (mut out) b)
+                      (al/al-push! (mut out) b)
+                      (al/al-push! (mut out) c)
+                      (al/al-push! (mut out) d))
+                    0))
+              (store! x (+ (load x) 1))))
+          (store! z (+ (load z) 1))))
+      (store! i (+ (load i) 1)))
+    (load out)))
+
+(defn bake-water [(islands (al/ArrayList m/Island))] (-> r/Model)
+  (let [(mut vertices) (generate-water islands)
+        model (upload (load vertices))]
+    (al/al-free! (mut vertices))
+    model))

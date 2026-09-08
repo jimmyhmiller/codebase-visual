@@ -1,0 +1,95 @@
+(module atlas.organic)
+(import "atlas.ray" :as r)
+(import "atlas.folders" :as folders)
+(import "atlas.geography" :as geography)
+(import "coil.arraylist" :as al)
+
+(defn envelope-radius [(bound f64)] (-> f64)
+  (if (> bound 0.0)
+      (+ bound (if (> (* bound 0.12) 4.0) (* bound 0.12) 4.0))
+      0.0))
+
+;;; Deterministic bent-coordinate search, not a disk-shaped settlement.
+;;; Collision tests operate on the resulting coordinates, never on the guide.
+(defn offset [(seed i64) (attempt i64) (scale f64)] (-> r/Vector3)
+  (let [distance (* 2.0 (r/sqrt (cast f64 attempt)))
+        angle (* 2.39996323 (cast f64 attempt))
+        heading (* 0.017 (cast f64 (% seed 367)))
+        phase (* 0.031 (cast f64 (% seed 173)))
+        x (* 1.65 (* distance (r/cos angle)))
+        z
+          (+ (* 0.72 (* distance (r/sin angle)))
+             (* (* 0.58 scale) (- (r/sin (+ (/ x scale) phase)) (r/sin phase))))]
+    (r/v3 (- (* x (r/cos heading)) (* z (r/sin heading)))
+          0.0
+          (+ (* x (r/sin heading)) (* z (r/cos heading))))))
+
+;;; Grow a two-dimensional frontier along a correlated terrain-density field.
+;;; Sampling the clearance frontier avoids both a filled spiral disk and a
+;;; forced single-file chain. Folder bounds remain conservative and invisible.
+(defn frontier [(nodes (al/ArrayList folders/Node))
+                (children (al/ArrayList i64))
+                (count i64)
+                (seed i64)
+                (radius f64)] (-> r/Vector3)
+  (let [(mut best) (r/v3 0.0 0.0 0.0)
+        (mut score) 1.0e30
+        hub (al/al-get nodes (al/al-get children 0))
+        scale (+ 20.0 (* 2.0 (load (field hub radius))))
+        (mut i) 0]
+    (loop (if (>= (load i) count) (break 0) 0)
+      (let [anchor (al/al-get nodes (al/al-get children (load i)))
+            center (load (field anchor position))
+            (mut j) 0]
+        (loop (if (>= (load j) 48) (break 0) 0)
+          (let [angle
+                  (+ (* 0.019 (cast f64 (% seed 997)))
+                     (* 6.283185307 (/ (cast f64 (load j)) 48.0)))
+                gap (geography/gap seed center radius)
+                distance (+ gap (+ radius (load (field anchor radius))))
+                p
+                  (r/v3 (+ (cast f64 (load (field center x)))
+                           (* distance (r/cos angle)))
+                        0.0
+                        (+ (cast f64 (load (field center z)))
+                           (* distance (r/sin angle))))
+                candidate (geography/placement-score seed p scale)
+                (mut fits) true
+                (mut k) 0]
+            (if (< candidate (load score))
+                (do
+                  (loop (if (or (>= (load k) count) (not (load fits)))
+                            (break 0)
+                            0)
+                    (let [other (al/al-get nodes (al/al-get children (load k)))
+                          minimum (+ 4.0 (+ radius (load (field other radius))))]
+                      (if (< (r/distance2 p (load (field other position)))
+                             (* minimum minimum))
+                          (store! fits false)
+                          0))
+                    (store! k (+ (load k) 1)))
+                  (if (load fits)
+                      (do (store! best p) (store! score candidate))
+                      0))
+                0))
+          (store! j (+ (load j) 1))))
+      (store! i (+ (load i) 1)))
+    ;; A finite frontier sample is an optimization, not an existence assumption.
+    ;; If all candidates are blocked, unbounded search guarantees placement.
+    (if (and (> count 0) (> (load score) 1.0e29))
+        (let [(mut attempt) 1]
+          (loop (let [p (offset seed (load attempt) scale)
+                      (mut k) 0
+                      (mut fits) true]
+                  (loop (if (>= (load k) count) (break 0) 0)
+                    (let [other (al/al-get nodes (al/al-get children (load k)))
+                          minimum (+ 4.0 (+ radius (load (field other radius))))]
+                      (if (< (r/distance2 p (load (field other position)))
+                             (* minimum minimum))
+                          (store! fits false)
+                          0))
+                    (store! k (+ (load k) 1)))
+                  (if (load fits) (do (store! best p) (break 0)) 0))
+            (store! attempt (+ (load attempt) 1))))
+        0)
+    (load best)))

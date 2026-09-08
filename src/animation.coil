@@ -1,0 +1,20 @@
+(module atlas.animation)
+(import "atlas.ray" :as r)
+
+(defn clock-step [(dt f64) (speed f64) (paused bool)] (-> f64)
+  (if paused 0.0 (* dt speed)))
+
+;;; One transition takes two simulation seconds, independent of render rate.
+(defn progress [(age f64)] (-> f64)
+  (let [t (r/clamp (/ age 2.0) 0.0 1.0)]
+    (* t (* t (- 3.0 (* 2.0 t))))))
+
+;;; Shared by color and shadow passes. The envelope includes every glyph.
+(defn clip-height [(state i64) (age f64)] (-> f64)
+  (let [p (progress age)]
+    (cond (= state 2) (+ 1.90 (* 3.0 p))
+          (= state 3) (+ 1.90 (* 3.0 (- 1.0 p)))
+          :else 10000.0)))
+
+(defn blueprint? [(state i64) (age f64)] (-> bool)
+  (or (= state 3) (and (= state 2) (< age 2.0))))

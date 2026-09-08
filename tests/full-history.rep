@@ -1,0 +1,10 @@
+# Request the earliest reachable commit through the timeline, then keep panning
+# while it loads. Capture late enough for native worker/terrain publication.
+c 7
+e 60 7 251 925 0 0
+e 61 6 0 0 0 0
+e 62 5 0 0 0 0
+e 80 2 68 0 0 0
+e 110 1 68 0 0 0
+e 800 2 82 0 0 0
+e 801 1 82 0 0 0

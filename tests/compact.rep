@@ -1,0 +1,8 @@
+# Resize to the supported minimum, fit the world, and scroll the inspector.
+# Event numbers follow raylib 5.5 src/rcore.c AutomationEventType.
+c 5
+e 10 21 1100 720 0 0
+e 14 2 82 0 0 0
+e 15 1 82 0 0 0
+e 20 7 1020 420 0 0
+e 21 8 0 -5 0 0

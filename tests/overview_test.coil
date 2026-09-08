@@ -1,0 +1,168 @@
+(module atlas.tests.overview)
+(import "atlas.overview" :as overview)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.landform" :as land)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+
+(deftest overview-preserves-every-member-and-every-change-state
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 56) (break 0) 0)
+               (let [(mut e) (zeroed m/Entity)]
+                 (store! (field e id) (load i))
+                 (store! (field e island) (/ (load i) 28))
+                 (store! (field e kind) (% (load i) 7))
+                 (store! (field e state) (% (/ (load i) 7) 4))
+                 (store! (field e position) (r/v3 (cast f64 (load i)) 2.0 0.0))
+                 (al/al-push! (mut (field s entities)) (load e)))
+               (store! i (+ (load i) 1)))
+             (let [(mut groups)
+                     (overview/build (mut s) 2 (alloc/malloc-allocator))
+                   (mut visited) (zeroed (array bool 56))]
+               (assert (= (load (field groups unmapped)) 0))
+               (assert (= (al/al-len (load (field groups groups))) 14))
+               (assert (= (al/al-len (load (field groups next))) 56))
+               (store! i 0)
+               (loop (if (>= (load i) 14) (break 0) 0)
+                 (let [g (al/al-get (load (field groups groups)) (load i))
+                       census (m/island-census (mut s) (/ (load i) 7))
+                       (mut at) (load (field g head))
+                       (mut count) 0
+                       (mut previous) -1]
+                   (assert (= (load (field g present)) 3))
+                   (assert (= (load (field g present))
+                              (load (index census (load (field g kind))))))
+                   (assert (= (load (field g total)) 4))
+                   (loop (if (< (load at) 0) (break 0) 0)
+                     (assert (< (load at) 56))
+                     (assert (not (load (index visited (load at)))))
+                     (store! (index visited (load at)) true)
+                     (let [e (al/al-get (load (field s entities)) (load at))]
+                       (assert (= (load (field e island))
+                                  (load (field g island))))
+                       (assert (= (load (field e kind)) (load (field g kind))))
+                       (assert (= (load (index (field g counts)
+                                               (load (field e state))))
+                                  1))
+                       (assert (> (load at) (load previous)))
+                       (store! previous (load at)))
+                     (store! count (+ (load count) 1))
+                     (store! at
+                             (al/al-get (load (field groups next)) (load at))))
+                   (assert (= (load count) 4))
+                   (assert (= (load previous) (load (field g tail))))
+                   ;; States 0,1,2 have indices base,base+7,base+14. Removed +21 is excluded.
+                   (assert (< (r/fabs (- (cast f64
+                                               (load (field (field g focus) x)))
+                                         (+ (cast f64
+                                                  (+ (* (/ (load i) 7) 28)
+                                                     (% (load i) 7)))
+                                            7.0)))
+                              0.00001)))
+                 (store! i (+ (load i) 1)))
+               (store! i 0)
+               (loop (if (>= (load i) 56) (break 0) 0)
+                 (assert (load (index visited (load i))))
+                 (store! i (+ (load i) 1)))
+               (overview/close! (mut groups))))
+
+           (scratch/scratch-close! (mut arena))))
+
+(deftest overview-handles-empty-removed-and-unmapped-declarations
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut empty) (overview/build (mut s) 0 (alloc/malloc-allocator))
+                 (mut e) (zeroed m/Entity)]
+             (assert (= (al/al-len (load (field empty groups))) 0))
+             (overview/close! (mut empty))
+             (store! (field e state) 3)
+             (store! (field e kind) 2)
+             (store! (field e position) (r/v3 10.0 2.0 -6.0))
+             (al/al-push! (mut (field s entities)) (load e))
+             (store! (field e island) -1)
+             (al/al-push! (mut (field s entities)) (load e))
+             (store! (field e island) 1)
+             (al/al-push! (mut (field s entities)) (load e))
+             (store! (field e island) 0)
+             (store! (field e kind) 7)
+             (al/al-push! (mut (field s entities)) (load e))
+             (store! (field e kind) 0)
+             (store! (field e state) 4)
+             (al/al-push! (mut (field s entities)) (load e))
+             (let [(mut groups)
+                     (overview/build (mut s) 1 (alloc/malloc-allocator))
+                   removed (al/al-get (load (field groups groups)) 2)
+                   vacant (al/al-get (load (field groups groups)) 0)]
+               (assert (= (load (field groups unmapped)) 4))
+               (assert (= (load (field removed present)) 0))
+               (assert (= (load (field removed total)) 1))
+               (assert (= (load (field removed head)) 0))
+               (assert (< (r/distance2 (load (field removed focus))
+                                       (r/v3 10.0 2.0 -6.0))
+                          0.00001))
+               (assert (= (load (field vacant head)) -1))
+               (assert (= (load (field vacant total)) 0))
+               (assert (= (al/al-get (load (field groups next)) 0) -1))
+               (overview/close! (mut groups))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest overview-landmark-disks-stay-separated-and-inside-every-coast
+         (let [(mut seed) 0]
+           (loop (if (>= (load seed) 100) (break 0) 0)
+             (let [(mut island) (zeroed m/Island)
+                   radius (+ 7.2 (* 0.73 (cast f64 (load seed))))
+                   (mut kind) 0]
+               (store! (field island seed) (* (load seed) 919))
+               (store! (field island radius) radius)
+               (store! (field island position) (r/v3 1200.0 0.0 -830.0))
+               (loop (if (>= (load kind) 7) (break 0) 0)
+                 (let [p (overview/anchor (load island) (load kind))
+                       disk (overview/footprint (load island) (load kind))
+                       reach
+                         (+ (r/sqrt (r/distance2 p
+                                                 (load (field island position))))
+                            disk)
+                       (mut other) (+ (load kind) 1)]
+                   (assert (< reach (* radius (* (land/plateau-scale) 0.805))))
+                   (loop (if (>= (load other) 7) (break 0) 0)
+                     (let [q (overview/anchor (load island) (load other))
+                           separation
+                             (+ disk
+                                (overview/footprint (load island) (load other)))]
+                       (assert (> (r/distance2 p q) (* separation separation))))
+                     (store! other (+ (load other) 1))))
+                 (store! kind (+ (load kind) 1))))
+             (store! seed (+ (load seed) 1)))))
+
+(deftest overview-scale-contains-symbols-and-preserves-foundation-height
+         (let [symbols (glyph/pick-bounds-cache)
+               (mut island) (zeroed m/Island)
+               (mut i) 0]
+           (store! (field island radius) 11.0)
+           (store! (field island position) (r/v3 14.0 0.0 -7.0))
+           (loop (if (>= (load i) 24) (break 0) 0)
+             (let [kind (if (>= (load i) 7) 3 (load i))
+                   local (load (index symbols (load i)))
+                   anchor (overview/anchor (load island) kind)
+                   scale (overview/scale (load island) kind local)
+                   bounds (overview/bounds local anchor scale)
+                   base (overview/point (r/v3 0.0 1.99 0.0) anchor scale)
+                   radius (overview/footprint (load island) kind)]
+               (assert (> scale 0.0))
+               (assert (< (r/distance2 (load (field bounds min)) anchor)
+                          (+ (* radius radius) 0.0001)))
+               (assert (< (r/distance2 (load (field bounds max)) anchor)
+                          (+ (* radius radius) 0.0001)))
+               (assert (< (r/fabs (- (cast f64 (load (field base y))) 1.99))
+                          0.00001))
+               (assert (< (r/distance2 base anchor) 0.00001)))
+             (store! i (+ (load i) 1)))))

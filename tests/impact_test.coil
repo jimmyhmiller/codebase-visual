@@ -1,0 +1,237 @@
+(module atlas.tests.impact)
+(import "atlas.impact" :as impact)
+(import "atlas.model" :as m)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.str" :as str)
+(import "atlas.ray" :as r)
+(import "coil.time" :as time)
+
+(defn now-seconds [] (-> f64)
+  (match (time/monotonic-now)
+    (Ok [instant]
+        (let [value instant]
+          (+ (cast f64 (load (field value sec)))
+             (/ (cast f64 (load (field value nsec))) 1000000000.0))))
+    (Err [_] (do (alloc/abort) 0.0))))
+
+(deftest indexed-impact-matches-scan-resolution
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut expected) (impact/empty a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 96) (break 0) 0)
+               (let [name
+                       (m/copy-text a
+                                    (str/cstr->str (r/TextFormat c"Type%lld"
+                                                                 (% (load i) 64))))
+                     path
+                       (m/copy-text a
+                                    (str/cstr->str (r/TextFormat c"m%lld/file.coil"
+                                                                 (/ (load i) 32))))]
+                 (m/emit! (mut s) path name 0 1 1 1)
+                 (let [e (al/al-elem [m/Entity] (field s entities) (load i))]
+                   (store! (field e id) (load i))
+                   (if (= (% (load i) 11) 0) (store! (field e state) 3) 0)))
+               (al/al-push! (mut (field expected heads)) -1)
+               (store! i (+ (load i) 1)))
+             (store! i 0)
+             (loop (if (>= (load i) 384) (break 0) 0)
+               (let [source (% (load i) 96)
+                     entity (al/al-get (load (field s entities)) source)
+                     target-entity
+                       (al/al-get (load (field s entities))
+                                  (% (* (load i) 7) 96))
+                     module
+                       (if (= (% (load i) 3) 0)
+                           "unknown"
+                           (load (field entity module)))
+                     name
+                       (if (= (% (load i) 10) 0)
+                           "Missing"
+                           (load (field target-entity name)))
+                     target
+                       (impact/resolve (load (field s entities)) name module)]
+                 (al/al-push! (mut (field s references))
+                              (m/Reference
+                                :source source
+                                :target (m/copy-text a name)
+                                :module (m/copy-text a module)))
+                 (cond (= target -2)
+                         (store! (field expected ambiguous)
+                                 (+ (load (field expected ambiguous)) 1))
+                       (or (< target 0) (= (load (field entity state)) 3))
+                         (store! (field expected unresolved)
+                                 (+ (load (field expected unresolved)) 1))
+                       (!= target source)
+                         (let [head
+                                 (al/al-get (load (field expected heads))
+                                            target)
+                               edge (al/al-len (load (field expected links)))]
+                           (al/al-push! (mut (field expected links))
+                                        (m/ImpactLink :source source :next head))
+                           (store! (al/al-elem [i64]
+                                               (field expected heads)
+                                               target)
+                                   edge))
+                       :else 0))
+               (store! i (+ (load i) 1)))
+             (let [(mut actual) (impact/build (mut s))]
+               (assert-eq (load (field actual ambiguous))
+                          (load (field expected ambiguous)))
+               (assert-eq (load (field actual unresolved))
+                          (load (field expected unresolved)))
+               (assert-eq (al/al-len (load (field actual links)))
+                          (al/al-len (load (field expected links))))
+               (store! i 0)
+               (loop (if (>= (load i) 96) (break 0) 0)
+                 (assert-eq (al/al-get (load (field actual heads)) (load i))
+                            (al/al-get (load (field expected heads)) (load i)))
+                 (store! i (+ (load i) 1)))
+               (store! i 0)
+               (loop (if (>= (load i) (al/al-len (load (field actual links))))
+                         (break 0)
+                         0)
+                 (let [x (al/al-get (load (field actual links)) (load i))
+                       y (al/al-get (load (field expected links)) (load i))]
+                   (assert-eq (load (field x source)) (load (field y source)))
+                   (assert-eq (load (field x next)) (load (field y next))))
+                 (store! i (+ (load i) 1)))
+               (impact/free! (mut actual)))
+             (impact/free! (mut expected)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest indexed-impact-traverses-ten-thousand-declarations
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 10000) (break 0) 0)
+               (let [name
+                       (m/copy-text a
+                                    (str/cstr->str (r/TextFormat c"Node%lld"
+                                                                 (load i))))]
+                 (m/emit! (mut s) "mod/chain.coil" name 0 1 1 1)
+                 (store! (field (al/al-elem [m/Entity]
+                                            (field s entities)
+                                            (load i))
+                                id)
+                         (load i))
+                 (if (> (load i) 0)
+                     (let [previous
+                             (al/al-get (load (field s entities))
+                                        (- (load i) 1))]
+                       (reference! (mut s)
+                                   (load i)
+                                   (load (field previous name))))
+                     0))
+               (store! i (+ (load i) 1)))
+             (let [start (now-seconds)
+                   (mut graph) (impact/build (mut s))
+                   built (now-seconds)
+                   result (impact/summarize (mut graph) (mut s) 0)]
+               (assert-eq (al/al-len (load (field graph links))) 9999)
+               (assert-eq (load (field result direct)) 1)
+               (assert-eq (load (field result indirect)) 9998)
+               (println "Impact 10000-node chain: build {} ms, traverse {} ms"
+                        (* 1000.0 (- built start))
+                        (* 1000.0 (- (now-seconds) built)))
+               (impact/free! (mut graph))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest impact-preparation-replaces-snapshot-owned-adjacency
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut s)
+                   (m/new-snapshot (scratch/scratch-allocator (mut arena)))]
+             (m/emit! (mut s) "mod/a.coil" "A" 0 1 1 1)
+             (m/emit! (mut s) "mod/b.coil" "B" 0 1 1 1)
+             (reference! (mut s) 1 "A")
+             (impact/prepare! (mut s))
+             (let [first (impact/summarize (field s impact) (mut s) 0)]
+               (assert-eq (load (field first direct)) 1))
+             (store! (field (al/al-elem [m/Entity] (field s entities) 1) state)
+                     3)
+             (impact/prepare! (mut s))
+             (let [second (impact/summarize (field s impact) (mut s) 0)]
+               (assert (load (field second available)))
+               (assert-eq (load (field second direct)) 0))
+             (assert-eq (al/al-len (load (field (field s impact) links))) 0))
+           (scratch/scratch-close! (mut arena))))
+
+(defn reference! [(s (ptr m/Snapshot)) (source i64) (target (slice u8))] (-> i64)
+  (let [e (al/al-get (load (field s entities)) source)]
+    (al/al-push! (mut (field s references))
+                 (m/Reference
+                   :source (load (field e id))
+                   :target target
+                   :module "mod")))
+  0)
+
+(deftest impact-follows-dependents-once-through-diamonds-and-cycles
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut s)
+                   (m/new-snapshot (scratch/scratch-allocator (mut arena)))]
+             (m/emit! (mut s) "mod/a.coil" "A" 0 1 1 1)
+             (m/emit! (mut s) "mod/b.coil" "B" 0 1 1 1)
+             (m/emit! (mut s) "mod/c.coil" "C" 0 1 1 1)
+             (m/emit! (mut s) "mod/d.coil" "D" 0 1 1 1)
+             (m/emit! (mut s) "mod/e.coil" "E" 0 1 1 1)
+             (reference! (mut s) 1 "A")
+             (reference! (mut s) 1 "A")
+             (reference! (mut s) 2 "A")
+             (reference! (mut s) 3 "B")
+             (reference! (mut s) 3 "C")
+             (reference! (mut s) 0 "D")
+             (reference! (mut s) 0 "E")
+             (reference! (mut s) 0 "A")
+             (let [(mut graph) (impact/build (mut s))
+                   (mut distances) (al/al-new [i64] (alloc/malloc-allocator))
+                   result
+                     (impact/summarize-into (mut graph)
+                                            (mut s)
+                                            0
+                                            (mut distances))]
+               (assert (load (field result available)))
+               (assert-eq (load (field result direct)) 2)
+               (assert-eq (load (field result indirect)) 1)
+               (assert-eq (al/al-get (load distances) 0) 0)
+               (assert-eq (al/al-get (load distances) 1) 1)
+               (assert-eq (al/al-get (load distances) 2) 1)
+               (assert-eq (al/al-get (load distances) 3) 2)
+               (assert-eq (al/al-get (load distances) 4) -1)
+               (al/al-free! (mut distances))
+               (impact/free! (mut graph))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest impact-does-not-guess-ambiguous-names-or-removed-baselines
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [(mut s)
+                   (m/new-snapshot (scratch/scratch-allocator (mut arena)))]
+             (m/emit! (mut s) "mod/a.coil" "A" 0 1 1 1)
+             (m/emit! (mut s) "mod/b.coil" "A" 0 1 1 1)
+             (m/emit! (mut s) "elsewhere/c.coil" "C" 0 1 1 1)
+             (m/emit! (mut s) "mod/c.coil" "C" 0 1 1 1)
+             (reference! (mut s) 3 "A")
+             (reference! (mut s) 3 "Missing")
+             (assert-eq (impact/resolve (load (field s entities)) "A" "mod") -2)
+             (assert-eq (impact/resolve (load (field s entities)) "C" "mod") 3)
+             (assert-eq (impact/resolve (load (field s entities)) "C" "unknown")
+                        -2)
+             (store! (field (al/al-elem [m/Entity] (field s entities) 2) state)
+                     3)
+             (let [(mut graph) (impact/build (mut s))
+                   removed (impact/summarize (mut graph) (mut s) 2)
+                   invalid (impact/summarize (mut graph) (mut s) -1)]
+               (assert-eq (load (field graph ambiguous)) 1)
+               (assert-eq (load (field graph unresolved)) 1)
+               (assert (not (load (field removed available))))
+               (assert (not (load (field invalid available))))
+               (impact/free! (mut graph))))
+           (scratch/scratch-close! (mut arena))))

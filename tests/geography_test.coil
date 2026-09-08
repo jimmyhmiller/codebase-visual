@@ -1,0 +1,122 @@
+(module atlas.tests.geography)
+(import "atlas.geography" :as geo)
+(import "atlas.terrain" :as terrain)
+(import "atlas.landform" :as land)
+(import "atlas.ray" :as r)
+(import "atlas.model" :as m)
+(import "atlas.spatial" :as spatial)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(defn island [] (-> m/Island)
+  (m/Island
+    :name "fixture"
+    :seed 131
+    :position (r/v3 31.25 0.0 -18.7)
+    :radius 30.0
+    :count 25
+    :changed 0))
+
+(deftest regional-field-is-repeatable-continuous-and-bounded
+         (let [(mut i) 0
+               (mut lo) 1.0
+               (mut hi) 0.0]
+           (loop (if (>= (load i) 500) (break 0) 0)
+             (let [x (* 1.3 (cast f64 (load i)))
+                   z (* -0.91 (cast f64 (load i)))
+                   n (geo/regional x z)]
+               (assert (>= n 0.0))
+               (assert (<= n 1.0))
+               (assert (< (r/fabs (- n (geo/regional x z))) 0.000000001))
+               (assert (< (r/fabs (- n (geo/regional (+ x 0.001) z))) 0.001))
+               (if (< n (load lo)) (store! lo n) 0)
+               (if (> n (load hi)) (store! hi n) 0))
+             (store! i (+ (load i) 1)))
+           (assert (> (- (load hi) (load lo)) 0.25))))
+
+(deftest site-ridge-cost-is-nonnegative-and-prefers-its-long-axis
+         (let [seed 131
+               angle (geo/heading seed)
+               along
+                 (geo/site-cost seed
+                                (* 20.0 (r/cos angle))
+                                (* 20.0 (r/sin angle)))
+               across
+                 (geo/site-cost seed
+                                (* -20.0 (r/sin angle))
+                                (* 20.0 (r/cos angle)))]
+           (assert (>= along 0.0))
+           (assert (> across (* 5.0 along)))))
+
+;;; Verify the actual sampled vertices that can participate in a triangle
+;;; touching a building disk. This covers both LODs, not only analytic heights.
+(deftest both-lods-preserve-complete-building-foundations
+         (let [island (island)
+               site (r/v3 43.63 2.0 -11.27)
+               (mut sites) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+               (mut lod) 0]
+           (al/al-push! (mut sites) site)
+           (let [(mut indexed)
+                   (spatial/build (load sites) (alloc/malloc-allocator))]
+             (loop (if (>= (load lod) 2) (break 0) 0)
+               (let [extent (* (land/main-coast-bound) 30.0)
+                     cells
+                       (cast i64
+                             (r/ceil (/ (* 2.0 extent)
+                                        (if (= (load lod) 0) 0.55 1.65))))
+                     step (/ (* 2.0 extent) (cast f64 cells))
+                     margin (+ 1.05 (* 1.414213563 step))
+                     (mut grid) (terrain/field-grid island (load indexed) cells)
+                     (mut i) 0
+                     (mut found) 0]
+                 (loop (if (>= (load i) (al/al-len (load grid))) (break 0) 0)
+                   (let [v (al/al-get (load grid) (load i))
+                         p (load (field v p))
+                         normal (load (field v normal))]
+                     (assert (> (load (field normal y)) (cast f32 0.0)))
+                     (if (<= (r/distance2 p site) (* margin margin))
+                         (do
+                           (assert (< (r/fabs (- (cast f64 (load (field p y)))
+                                                 1.94))
+                                      0.00001))
+                           (store! found (+ (load found) 1)))
+                         0))
+                   (store! i (+ (load i) 1)))
+                 (assert (> (load found) 0))
+                 (al/al-free! (mut grid)))
+               (store! lod (+ (load lod) 1)))
+             (al/al-free! (mut indexed)))
+           (al/al-free! (mut sites))))
+
+(deftest terrain-reservation-ends-underwater-and-has-nonradial-relief
+         (let [island (island)
+               radius (* 30.0 (land/main-coast-bound))
+               (mut i) 0
+               (mut lo) 100.0
+               (mut hi) -100.0]
+           (loop (if (>= (load i) 128) (break 0) 0)
+             (let [angle (* 6.283185307 (/ (cast f64 (load i)) 128.0))
+                   x (+ 31.25 (* radius (r/cos angle)))
+                   z (+ -18.7 (* radius (r/sin angle)))
+                   inner
+                     (geo/bed island
+                              (+ 31.25 (* 18.0 (r/cos angle)))
+                              (+ -18.7 (* 18.0 (r/sin angle))))]
+               (assert (< (geo/elevation island x z 8.0) -0.5))
+               (if (< inner (load lo)) (store! lo inner) 0)
+               (if (> inner (load hi)) (store! hi inner) 0))
+             (store! i (+ (load i) 1)))
+           (assert (> (- (load hi) (load lo)) 2.0))))
+
+(deftest field-shelves-fade-at-boundary-and-do-not-enable-radial-rings
+         (let [island (island)
+               (mut i) 0]
+           (loop (if (>= (load i) 64) (break 0) 0)
+             (let [angle (* 6.283185307 (/ (cast f64 (load i)) 64.0))
+                   v
+                     (terrain/shelf-vertex island
+                                           (+ 31.25 (* 63.0 (r/cos angle)))
+                                           (+ -18.7 (* 63.0 (r/sin angle))))]
+               (assert-eq (cast i64 (load (field (field v color) a))) 0)
+               (assert (> (load (field (field v uv) y)) (cast f32 1.5))))
+             (store! i (+ (load i) 1)))))

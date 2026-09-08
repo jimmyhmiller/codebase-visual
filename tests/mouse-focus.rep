@@ -1,0 +1,7 @@
+# Click the visible Order roof in the default demo, then focus with F.
+c 5
+e 10 7 779 525 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 20 2 70 0 0 0
+e 21 1 70 0 0 0

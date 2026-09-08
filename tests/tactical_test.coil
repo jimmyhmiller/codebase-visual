@@ -1,0 +1,41 @@
+(module atlas.tests.tactical)
+(import "atlas.ray" :as r)
+(import "atlas.tactical" :as tactical)
+
+(deftest tactical-map-project-click-roundtrip
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 20) (break 0) 0)
+             (let [frame (r/v3 -34.0 (+ 0.05 (* (cast f64 (load i)) 0.17)) 23.0)
+                   center (r/v2 100.0 544.0)
+                   point (r/v3 (- (cast f64 (load i)) 10.0) 0.0 -42.0)
+                   pixel (tactical/project point frame center)
+                   restored (tactical/unproject pixel frame center)]
+               (assert (< (r/distance2 point restored) 0.000001)))
+             (store! i (+ (load i) 1)))))
+
+(deftest tactical-footprint-projects-to-viewport-corners
+         (let [(mut orientation) 0]
+           (loop (if (>= (load orientation) 8) (break 0) 0)
+             (let [yaw (* (cast f64 (load orientation)) 0.81)
+                   pitch (+ 0.25 (* (cast f64 (load orientation)) 0.16))
+                   target (r/v3 -23.0 3.0 11.0)
+                   camera (r/orbit-camera target yaw pitch 63.0)
+                   (mut i) 0]
+               (loop (if (>= (load i) 4) (break 0) 0)
+                 (let [point
+                         (tactical/corner target
+                                          yaw
+                                          pitch
+                                          63.0
+                                          1100.0
+                                          824.0
+                                          (load i))
+                       pixel (r/GetWorldToScreenEx point camera 1100 824)
+                       x (if (or (= (load i) 0) (= (load i) 3)) 0.0 1100.0)
+                       y (if (< (load i) 2) 0.0 824.0)]
+                   (assert (< (r/fabs (- (cast f64 (load (field pixel x))) x))
+                              0.02))
+                   (assert (< (r/fabs (- (cast f64 (load (field pixel y))) y))
+                              0.02)))
+                 (store! i (+ (load i) 1))))
+             (store! orientation (+ (load orientation) 1)))))

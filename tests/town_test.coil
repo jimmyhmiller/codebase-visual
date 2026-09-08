@@ -1,0 +1,72 @@
+(module atlas.tests.town)
+(import "atlas.view" :as view)
+(import "atlas.world" :as world)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.ray" :as r)
+(import "atlas.town" :as town)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+
+(deftest town-selection-and-entity-list-include-single-structure-islands
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut v) (zeroed view/View)
+                 (mut w) (world/new-world a)
+                 (mut snapshot) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut snapshot)
+                                       "single.coil"
+                                       "(module single) (defstruct Alone [(id i64)])")
+             (world/register! (mut w) (mut snapshot))
+             (world/pack! (mut w))
+             (world/apply-layout! (mut w) (mut snapshot))
+             (view/select-island! (mut v) (mut w) 0 true)
+             (assert-eq (load (field v selected)) -1)
+             (assert-eq (load (field v selected-island)) 0)
+             (assert-eq (view/island-entity-count (mut snapshot) 0) 1)
+             (assert-eq (view/island-entity-index (mut snapshot) 0 0) 0)
+             (assert-eq (view/island-entity-index (mut snapshot) 0 1) -1)
+             (assert-eq (view/island-entity-index (mut snapshot) 1 0) -1)
+             (view/begin-change! (mut v) (mut snapshot))
+             (assert-eq (load (field v selected-island)) 0)
+             (assert (not (view/escape! (mut v))))
+             (assert-eq (load (field v selected-island)) -1))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest island-visibility-uses-present-structures-not-history-or-removal-ghosts
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot a)
+                 (mut v) (zeroed view/View)]
+             (analyzer/analyze-source! (mut before)
+                                       "old.coil"
+                                       "(module old) (defstruct Gone [(id i64)])")
+             (analyzer/analyze-source! (mut after)
+                                       "new.coil"
+                                       "(module new) (defstruct New [(label (slice u8))])")
+             (world/register! (mut w) (mut before))
+             (world/reconcile! (mut before) (mut after))
+             (world/register! (mut w) (mut after))
+             (view/begin-change! (mut v) (mut before))
+             (assert (view/island-present? (mut v) 0))
+             (assert (not (view/island-present? (mut v) 1)))
+             (view/begin-change! (mut v) (mut after))
+             (assert (not (view/island-present? (mut v) 0)))
+             (assert (view/island-present? (mut v) 1))
+             (assert-eq (view/island-population (mut v) 1) 1)
+             (assert-eq (al/al-len (load (field w islands))) 2)
+             (view/begin-change! (mut v) (mut before))
+             (assert (view/island-present? (mut v) 0))
+             (assert (not (view/island-present? (mut v) 1)))
+             (al/al-free! (mut (field v island-counts))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest town-building-grows-and-stays-inside-reserved-square
+         (assert (< (town/scale-for 1) (town/scale-for 25)))
+         (assert (< (town/scale-for 25) (town/scale-for 200)))
+         (assert (<= (* (* 1.7 (r/sqrt 2.0)) (town/scale-for 100000)) 6.0)))

@@ -1,0 +1,359 @@
+(module atlas.tests.model)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.model" :as m)
+(import "atlas.world" :as world)
+(import "atlas.timeline" :as timeline)
+(import "atlas.ray" :as r)
+(import "atlas.landform" :as land)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-len])
+
+(defstruct CustomAnalyzer [(calls i64)])
+
+(impl analyzer/Analyzer CustomAnalyzer
+  (analyze [(self (ptr CustomAnalyzer))
+            (sink (ptr m/Snapshot))
+            (path (slice u8))
+            (source (slice u8))]
+           (-> i64)
+           (store! (field self calls) (+ (load (field self calls)) 1))
+           (m/emit! sink path "CustomDeclaration" 5 1 1 (m/stable-hash source))
+           1))
+
+(deftest custom-analyzer-is-selected-through-registry
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut registry) (analyzer/defaults a)
+                 adapter (alloc/box! a CustomAnalyzer (CustomAnalyzer :calls 0))
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/register! (mut registry) ".custom" adapter)
+             (assert (>= (analyzer/lookup (mut registry) "domain.custom") 0))
+             (analyzer/analyze-registered! (mut registry)
+                                           (mut s)
+                                           "domain.custom"
+                                           "custom language")
+             (assert-eq (load (field adapter calls)) 1)
+             (assert-eq (al/al-len (load (field s entities))) 1)
+             (assert-eq (load (field s file-count)) 1)
+             (let [entity (al/al-get (load (field s entities)) 0)]
+               (assert (str/str-eq (load (field entity name))
+                                   "CustomDeclaration"))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest declaration-shapes
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut s)
+                                       "tree/domain.coil"
+                                       "(defstruct Hierarchy [(children (slice i64))])\n(defstruct Journal [(entries (slice i64))])\n(defstruct Queue [(head i64) (tail i64)])")
+             (assert-eq (al/al-len (load (field s entities))) 3)
+             (let [tree (al/al-get (load (field s entities)) 0)
+                   map (al/al-get (load (field s entities)) 1)
+                   queue (al/al-get (load (field s entities)) 2)]
+               (assert-eq (load (field tree kind)) 3)
+               (assert-eq (load (field map kind)) 2)
+               (assert-eq (load (field queue kind)) 4)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest whitespace-does-not-change-identity-or-fingerprint
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut before)
+                                       "order/domain.coil"
+                                       "(defstruct Order [(id i64)])")
+             (analyzer/analyze-source! (mut after)
+                                       "order/domain.coil"
+                                       "; comment\n\n(defstruct Order\n [(id i64)])")
+             (world/reconcile! (mut before) (mut after))
+             (let [old (al/al-get (load (field before entities)) 0)
+                   next (al/al-get (load (field after entities)) 0)]
+               (assert-eq (load (field old id)) (load (field next id)))
+               (assert-eq (load (field next state)) 0)
+               (assert-eq (load (field next line)) 3)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest additions-modifications-and-removals
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut before)
+                                       "domain.coil"
+                                       "(defstruct Order [(id i64)]) (defsum Legacy (Old))")
+             (analyzer/analyze-source! (mut after)
+                                       "domain.coil"
+                                       "(defstruct Order [(id i64) (priority i64)]) (defsum Priority (Normal))")
+             (world/reconcile! (mut before) (mut after))
+             (assert-eq (al/al-len (load (field after entities))) 3)
+             (let [changed (al/al-get (load (field after entities)) 0)
+                   added (al/al-get (load (field after entities)) 1)
+                   removed (al/al-get (load (field after entities)) 2)]
+               (assert-eq (load (field changed state)) 1)
+               (assert-eq (load (field added state)) 2)
+               (assert-eq (load (field removed state)) 3)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest geography-survives-insertion
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut before)
+                                       "orders/domain.coil"
+                                       "(defstruct Order [(id i64)])")
+             (world/register! (mut w) (mut before))
+             (analyzer/analyze-source! (mut after)
+                                       "orders/domain.coil"
+                                       "(defstruct New [(id i64)]) (defstruct Order [(id i64)])")
+             (world/register! (mut w) (mut after))
+             (let [old (al/al-get (load (field before entities)) 0)
+                   next (al/al-get (load (field after entities)) 1)
+                   p (load (field old position))
+                   q (load (field next position))]
+               (assert-eq (< (r/fabs (- (cast f64 (load (field p x)))
+                                        (cast f64 (load (field q x)))))
+                             0.000001)
+                          true)
+               (assert-eq (< (r/fabs (- (cast f64 (load (field p z)))
+                                        (cast f64 (load (field q z)))))
+                             0.000001)
+                          true)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest rename-then-edit-retains-durable-identity
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut first) (m/new-snapshot a)
+                 (mut renamed) (m/new-snapshot a)
+                 (mut edited) (m/new-snapshot a)]
+             (analyzer/analyze-source! (mut first)
+                                       "orders.coil"
+                                       "(defstruct Order [(id i64)])")
+             (analyzer/analyze-source! (mut renamed)
+                                       "orders.coil"
+                                       "(defstruct Purchase [(id i64)])")
+             (world/reconcile! (mut first) (mut renamed))
+             (analyzer/analyze-source! (mut edited)
+                                       "orders.coil"
+                                       "(defstruct Purchase [(id i64) (priority i64)])")
+             (world/reconcile! (mut renamed) (mut edited))
+             (assert-eq (al/al-len (load (field renamed entities))) 1)
+             (assert-eq (al/al-len (load (field edited entities))) 1)
+             (let [original (al/al-get (load (field first entities)) 0)
+                   last (al/al-get (load (field edited entities)) 0)]
+               (assert-eq (load (field original id)) (load (field last id)))
+               (assert-eq (load (field last state)) 1)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest incomplete-and-quoted-source-is-safe
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 empty-string (analyzer/tokenize a "\"" true)]
+             (assert-eq (al/al-len empty-string) 1)
+             (assert-eq (slice-len (analyzer/text-at empty-string 0)) 0)
+             (analyzer/analyze-source! (mut s)
+                                       "quoted.coil"
+                                       "(defn quoted [] (-> i64) (println \") (defstruct Fake [])\") 1) (defstruct Actual [(id i64)])")
+             (assert-eq (al/al-len (load (field s entities))) 2)
+             (let [actual (al/al-get (load (field s entities)) 1)]
+               (assert-eq (str/str-eq (load (field actual source))
+                                      "(defstruct Actual [(id i64)])")
+                          true)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest quoted-and-unquoted-values-have-distinct-fingerprints
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 quoted (analyzer/tokenize a "\"value\"" true)
+                 symbol (analyzer/tokenize a "value" true)]
+             (assert-eq (= (analyzer/token-hash quoted 0 1)
+                           (analyzer/token-hash symbol 0 1))
+                        false))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest packed-footprints-do-not-overlap
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 6) (break 0) 0)
+               (al/al-push! (mut (field w islands))
+                            (m/Island
+                              :name "test"
+                              :seed (load i)
+                              :position (r/v3 0.0 0.0 0.0)
+                              :radius (+ 4.0 (* 3.0 (cast f64 (load i))))
+                              :count 0
+                              :changed 0))
+               (store! i (+ (load i) 1)))
+             (world/pack-from! (mut w) 0)
+             (store! i 0)
+             (loop (if (>= (load i) 6) (break 0) 0)
+               (let [island (al/al-get (load (field w islands)) (load i))
+                     (mut j) (+ (load i) 1)]
+                 (loop (if (>= (load j) 6) (break 0) 0)
+                   (let [other (al/al-get (load (field w islands)) (load j))
+                         minimum
+                           (+ 2.5
+                              (* (land/main-coast-bound)
+                                 (+ (load (field island radius))
+                                    (load (field other radius)))))]
+                     (assert (>= (r/distance2 (load (field island position))
+                                              (load (field other position)))
+                                 (* minimum minimum))))
+                   (store! j (+ (load j) 1))))
+               (store! i (+ (load i) 1))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest flat-packing-centers-largest-module-without-renumbering
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 3) (break 0) 0)
+               (al/al-push! (mut (field w islands))
+                            (m/Island
+                              :name "module"
+                              :seed (load i)
+                              :position (r/v3 0.0 0.0 0.0)
+                              :radius 8.0
+                              :count (* (load i) 10)
+                              :changed 0))
+               (store! i (+ (load i) 1)))
+             (world/pack-from! (mut w) 0)
+             (assert-eq (world/hub-index (mut w)) 2)
+             (let [hub (al/al-get (load (field w islands)) 2)]
+               (assert (< (r/distance2 (load (field hub position))
+                                       (r/v3 0.0 0.0 0.0))
+                          0.000001)))
+             (store! i 0)
+             (loop (if (>= (load i) 3) (break 0) 0)
+               (let [island (al/al-get (load (field w islands)) (load i))]
+                 (assert-eq (load (field island seed)) (load i)))
+               (store! i (+ (load i) 1))))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest live-growth-preserves-neighbors-and-local-slots
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut before) (m/new-snapshot a)
+                 (mut after) (m/new-snapshot a)
+                 (mut i) 0]
+             (m/emit! (mut before) "alpha/domain.coil" "OriginalA" 0 1 1 1)
+             (m/emit! (mut before) "beta/domain.coil" "OriginalB" 0 1 1 2)
+             (m/emit! (mut before) "fixed/domain.coil" "Anchor" 0 1 1 3)
+             (world/register! (mut w) (mut before))
+             (world/pack! (mut w))
+             (world/apply-layout! (mut w) (mut before))
+             (let [fixed (al/al-get (load (field w islands)) 2)
+                   anchor (load (field fixed position))
+                   original (al/al-get (load (field before entities)) 0)
+                   original-id (load (field original id))]
+               (m/emit! (mut after) "alpha/domain.coil" "OriginalA" 0 1 1 1)
+               (m/emit! (mut after) "beta/domain.coil" "OriginalB" 0 1 1 2)
+               (m/emit! (mut after) "fixed/domain.coil" "Anchor" 0 1 1 3)
+               (loop (if (>= (load i) 400) (break 0) 0)
+                 (let [name
+                         (m/copy-text a
+                                      (str/cstr->str (r/TextFormat c"Growth%lld"
+                                                                   (load i))))]
+                   (m/emit! (mut after) "alpha/domain.coil" name 0 1 1 (load i))
+                   (m/emit! (mut after) "beta/domain.coil" name 0 1 1 (load i)))
+                 (store! i (+ (load i) 1)))
+               (m/emit! (mut after) "new/domain.coil" "NewModule" 0 1 1 4)
+               (assert (> (world/register-live! (mut w) (mut after)) 0))
+               (assert-eq (al/al-len (load (field w islands))) 4)
+               (let [fixed-now (al/al-get (load (field w islands)) 2)]
+                 (assert (< (r/distance2 anchor
+                                         (load (field fixed-now position)))
+                            0.000001)))
+               (store! i 0)
+               (loop (if (>= (load i) 4) (break 0) 0)
+                 (let [island (al/al-get (load (field w islands)) (load i))]
+                   (assert (world/footprint-fits? (mut w)
+                                                  (load i)
+                                                  (load (field island position))
+                                                  4)))
+                 (store! i (+ (load i) 1)))
+               (world/apply-layout! (mut w) (mut before))
+               (let [old (al/al-get (load (field before entities)) 0)
+                     current (al/al-get (load (field after entities)) 0)
+                     island (al/al-get (load (field w islands)) 0)]
+                 (assert-eq (load (field current id)) original-id)
+                 (assert (< (r/distance2 (load (field old position))
+                                         (load (field current position)))
+                            0.000001))
+                 (assert (>= (r/distance2 (load (field current position))
+                                          (load (field island position)))
+                             49.0)))
+               (assert-eq (world/register-live! (mut w) (mut after)) 0)))
+           (scratch/scratch-close! (mut arena))))
+
+(deftest large-module-registration-does-not-truncate-terrain-radius
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut w) (world/new-world a)
+                 (mut s) (m/new-snapshot a)
+                 (mut i) 0]
+             (loop (if (>= (load i) 3000) (break 0) 0)
+               (m/emit! (mut s)
+                        "large/domain.coil"
+                        (m/copy-text a
+                                     (str/cstr->str (r/TextFormat c"Building%lld"
+                                                                  (load i))))
+                        0
+                        1
+                        1
+                        (load i))
+               (store! i (+ (load i) 1)))
+             (world/register! (mut w) (mut s))
+             (let [island (al/al-get (load (field w islands)) 0)
+                   radius (load (field island radius))]
+               (assert (> radius 80.0))
+               (store! i 0)
+               (loop (if (>= (load i) (al/al-len (load (field s entities))))
+                         (break 0)
+                         0)
+                 (let [entity (al/al-get (load (field s entities)) (load i))
+                       p (load (field entity position))
+                       center (load (field island position))
+                       required
+                         (land/required-site-radius (* (cast f64
+                                                             (% (load (field island
+                                                                             seed))
+                                                                997))
+                                                       0.019)
+                                                    (- (cast f64
+                                                             (load (field p x)))
+                                                       (cast f64
+                                                             (load (field center
+                                                                          x))))
+                                                    (- (cast f64
+                                                             (load (field p z)))
+                                                       (cast f64
+                                                             (load (field center
+                                                                          z)))))]
+                   (assert (>= (+ radius 0.00001) required)))
+                 (store! i (+ (load i) 1)))))
+           (scratch/scratch-close! (mut arena))))

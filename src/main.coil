@@ -1,0 +1,829 @@
+(module atlas.main)
+(import "atlas.impact" :as impact)
+(import "atlas.tactical" :as tactical)
+(import "atlas.ray" :as r)
+(import "atlas.repository" :as git)
+(import "atlas.demo" :as demo)
+(import "atlas.world" :as world)
+(import "atlas.view" :as view)
+(import "atlas.model" :as m)
+(import "atlas.timeline" :as timeline)
+(import "atlas.live" :as live)
+(import "atlas.terrain" :as terrain)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.animation" :as animation)
+(import "atlas.search" :as search)
+(import "atlas.history" :as history)
+(import "coil.hashmap" :as hm)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-len])
+
+(defn publication-ready? [(job (ptr live/Job))
+                          (stage (ptr terrain/UploadStage))] (-> bool)
+  (if (not (load (field job joined))) (live/join! job) 0)
+  (if (load (field job geometry-ready))
+      (terrain/upload-step! stage (load (field job vertices)))
+      true))
+
+(defn preparation! [(phase (ptr i8)) (done i64) (total i64)] (-> i64)
+  (r/BeginDrawing)
+  (r/ClearBackground (r/rgba 11 17 21 255))
+  (r/DrawText c"ATLAS / PREPARING PLAYABLE HISTORY"
+              70
+              80
+              28
+              (r/rgba 232 225 207 255))
+  (r/DrawText phase 70 145 20 (r/rgba 255 180 75 255))
+  (r/DrawText (r/TextFormat c"%lld / %lld commits" done total)
+              70
+              190
+              20
+              (r/rgba 190 205 201 255))
+  (r/DrawRectangle 70 240 900 8 (r/rgba 37 51 56 255))
+  (if (> total 0)
+      (do
+        (r/DrawRectangle 70
+                         240
+                         (cast i32 (/ (* done 900) total))
+                         8
+                         (r/rgba 255 180 75 255))
+        0)
+      0)
+  (r/DrawText c"Analysis is shared by Git blob. Playback will not analyze or rebuild terrain."
+              70
+              285
+              18
+              (r/rgba 190 205 201 255))
+  (r/EndDrawing)
+  0)
+
+(defn run [(a (dyn alloc/Allocator))
+           (repo (ptr git/git_repository))
+           (requested (ptr i8))
+           (history-limit i64)
+           (demo? bool)] (-> i64)
+  (block :run
+           (let [(mut registry) (analyzer/defaults a)
+                 revisions (git/history-all-from a repo history-limit requested)
+                 n (al/al-len revisions)
+                 (mut cache) (history/new-cache a)
+                 (mut site-ops) (world/site-ops)
+                 (mut seen)
+                   (hm/hm-new [world/SiteKey i64]
+                              (alloc/malloc-allocator)
+                              (mut site-ops))
+                 (mut snapshots) (al/al-new [m/Snapshot] a)
+                 (mut w) (world/new-world a)
+                 (mut i) 0]
+             (if (= n 0)
+                 (do (println "Repository has no commits to visualize.") 1)
+                 (do
+                   (r/SetConfigFlags (cast u32 36))
+                   (r/InitWindow 1600
+                                 1000
+                                 c"ATLAS / A living map of the codebase")
+                   (r/SetExitKey 0)
+                   (r/SetWindowMinSize 1100 720)
+                   (r/SetTargetFPS 60)
+                   (loop (if (>= (load i) n) (break 0) 0)
+                     (if (!= (r/WindowShouldClose) (cast u8 0))
+                         (do
+                           (hm/hm-free! (mut seen))
+                           (r/CloseWindow)
+                           (return-from :run 0))
+                         0)
+                     (preparation! c"Preparing snapshots and actual-parent comparisons"
+                                   (load i)
+                                   n)
+                     (let [revision (al/al-get revisions (load i))
+                           parent-oid (history/parent-oid a repo revision)
+                           (mut parent-index) -1
+                           (mut j) 0
+                           (mut snapshot)
+                             (history/snapshot! (mut cache)
+                                                (mut registry)
+                                                repo
+                                                revision)]
+                       (loop (if (>= (load j) (load i)) (break 0) 0)
+                         (let [candidate (al/al-get revisions (load j))]
+                           (if (str/str-eq (load (field candidate oid))
+                                           parent-oid)
+                               (store! parent-index (load j))
+                               0))
+                         (store! j (+ (load j) 1)))
+                       (if (>= (load parent-index) 0)
+                           (world/reconcile-owned! (al/al-elem [m/Snapshot]
+                                                               (mut snapshots)
+                                                               (load parent-index))
+                                                   (mut snapshot)
+                                                   true)
+                           (let [(mut parent)
+                                   (if (> (slice-len parent-oid) 0)
+                                       (history/snapshot! (mut cache)
+                                                          (mut registry)
+                                                          repo
+                                                          (m/Revision
+                                                            :oid parent-oid
+                                                            :title
+                                                              "Parent outside history cap"
+                                                            :author ""))
+                                       (m/new-snapshot a))]
+                             (world/reconcile-owned! (mut parent)
+                                                     (mut snapshot)
+                                                     true)))
+                       (let [(mut additions)
+                               (m/new-snapshot (alloc/malloc-allocator))]
+                         (store! (field additions references)
+                                 (load (field snapshot references)))
+                         (store! (field additions paths)
+                                 (load (field snapshot paths)))
+                         (store! (field additions sources)
+                                 (load (field snapshot sources)))
+                         (store! j 0)
+                         (loop (if (>= (load j)
+                                       (al/al-len (load (field snapshot
+                                                               entities))))
+                                   (break 0)
+                                   0)
+                           (let [e
+                                   (al/al-get (load (field snapshot entities))
+                                              (load j))
+                                 id (world/site-key e)]
+                             (match (hm/hm-get (load seen) id)
+                               (Some [_] 0)
+                               (None []
+                                     (do
+                                       (al/al-push! (mut (field additions
+                                                                entities))
+                                                    e)
+                                       (hm/hm-put! (mut seen) id 1)
+                                       0))))
+                           (store! j (+ (load j) 1)))
+                         (world/register! (mut w) (mut additions))
+                         (al/al-free! (mut (field additions entities))))
+                       (impact/prepare! (mut snapshot))
+                       (al/al-push! (mut snapshots) (load snapshot)))
+                     (if (= (% (load i) 25) 0)
+                         (do
+                           (println "Prepared history {}/{}; {} unique file analyses"
+                                    (+ (load i) 1)
+                                    n
+                                    (load (field cache analyses)))
+                           0)
+                         0)
+                     (store! i (+ (load i) 1)))
+                   (hm/hm-free! (mut seen))
+                   (preparation! c"Packing shared island terrain" n n)
+                   (world/pack! (mut w))
+                   (store! i 0)
+                   (loop (if (>= (load i) n) (break 0) 0)
+                     (world/apply-layout! (mut w)
+                                          (al/al-elem [m/Snapshot]
+                                                      (mut snapshots)
+                                                      (load i)))
+                     (world/prepare-routes! (mut w)
+                                            (al/al-elem [m/Snapshot]
+                                                        (mut snapshots)
+                                                        (load i)))
+                     (store! i (+ (load i) 1)))
+                   (println "Atlas prepared {} reachable commits, {} islands, {} stable entities; {} unique file analyses. All historical seeks are resident."
+                            n
+                            (al/al-len (load (field w islands)))
+                            (al/al-len (load (field w registry)))
+                            (load (field cache analyses)))
+                   (let [(mut v) (view/new-view (mut w))
+                         (mut frame-arena) (zeroed scratch/ScratchArena)
+                         (mut current)
+                           (if (and demo? (= (cast i64 requested) 0) (> n 3))
+                               3
+                               (- n 1))
+                         (mut playing) false
+                         (mut scrubbing) false
+                         (mut animation-paused) false
+                         (mut elapsed) 0.0
+                         (mut frame) 0
+                         capture (git/env c"ATLAS_CAPTURE")
+                         profile (git/env c"ATLAS_PROFILE")
+                         capture-frames-env (git/env c"ATLAS_CAPTURE_FRAMES")
+                         capture-frames
+                           (if (= (cast i64 capture-frames-env) 0)
+                               90
+                               (cast i64 (r/TextToInteger capture-frames-env)))
+                         replay-path (git/env c"ATLAS_REPLAY")
+                         replay
+                           (if (= (cast i64 replay-path) 0)
+                               (zeroed r/AutomationEventList)
+                               (r/LoadAutomationEventList replay-path))
+                         (mut event-index) 0
+                         job-a (live/new-job-with a repo (mut registry))
+                         job-b (live/new-job-with a repo (mut registry))
+                         (mut upload-stage) (terrain/new-upload-stage)
+                         (mut working) (cast (ptr live/Job) 0)
+                         (mut latest) (cast (ptr m/Snapshot) 0)
+                         (mut live-mode) false
+                         (mut live-elapsed) 1.0]
+                     (scratch/scratch-init (mut frame-arena)
+                                           (alloc/malloc-allocator))
+                     (view/fit-world! (mut v) (mut w))
+                     (view/begin-change! (mut v)
+                                         (al/al-elem [m/Snapshot]
+                                                     (mut snapshots)
+                                                     (load current)))
+                     (view/refresh-folders! (mut v)
+                                            (mut w)
+                                            (al/al-elem [m/Snapshot]
+                                                        (mut snapshots)
+                                                        (load current)))
+                     (loop (if (!= (r/WindowShouldClose) (cast u8 0))
+                               (break 0)
+                               0)
+                       (loop (if (>= (load event-index)
+                                     (cast i64 (load (field replay count))))
+                                 (break 0)
+                                 0)
+                         (let [event
+                                 (load (index (load (field replay events))
+                                              (load event-index)))]
+                           (if (> (cast i64 (load (field event frame)))
+                                  (load frame))
+                               (break 0)
+                               0)
+                           (if (= (load (field event type)) (cast u32 1000))
+                               (view/text-input! (mut v)
+                                                 (cast i64
+                                                       (load (index (field event
+                                                                           params)
+                                                                    0))))
+                               (do (r/PlayAutomationEvent event) 0)))
+                         (store! event-index (+ (load event-index) 1)))
+                       (if (and (!= (r/IsKeyPressed 256) (cast u8 0))
+                                (view/escape! (mut v)))
+                           (break 0)
+                           0)
+                       (let [frame-start (r/GetTime)
+                             previous-index (load current)
+                             previous-display
+                               (if (and (load live-mode)
+                                        (!= (cast i64 (load latest)) 0))
+                                   (load latest)
+                                   (al/al-elem [m/Snapshot]
+                                               (mut snapshots)
+                                               (load current)))
+                             search-blocked
+                               (view/search-input! (mut v) previous-display)
+                             previous-selected (load (field v selected))
+                             had-selection
+                               (and (>= previous-selected 0)
+                                    (< previous-selected
+                                       (al/al-len (load (field previous-display
+                                                               entities)))))
+                             selected-id
+                               (if had-selection
+                                   (let [entity
+                                           (al/al-get (load (field previous-display
+                                                                   entities))
+                                                      previous-selected)]
+                                     (load (field entity id)))
+                                   0)
+                             dt (r/clamp (cast f64 (r/GetFrameTime)) 0.0 0.1)
+                             mouse (r/GetMousePosition)
+                             mx (cast f64 (load (field mouse x)))
+                             my (cast f64 (load (field mouse y)))
+                             clicked
+                               (and (not search-blocked)
+                                    (!= (r/IsMouseButtonPressed 0) (cast u8 0)))
+                             bottom (- (cast f64 (r/GetScreenHeight)) 100.0)
+                             transport
+                               (if clicked
+                                   (view/transport-action (cast f64
+                                                                (r/GetScreenWidth))
+                                                          (cast f64
+                                                                (r/GetScreenHeight))
+                                                          (r/v2 mx my))
+                                   0)]
+                         (if (view/key-pressed? (mut v) 76)
+                             (do
+                               (store! live-mode (not (load live-mode)))
+                               (store! playing false)
+                               (store! animation-paused false)
+                               (store! live-elapsed 1.0))
+                             0)
+                         (if (or (view/key-pressed? (mut v) 32)
+                                 (= transport 2))
+                             (do
+                               (store! playing (not (load playing)))
+                               (store! animation-paused (not (load playing)))
+                               (store! elapsed 0.0)
+                               (store! live-mode false)
+                               (if (and (load playing)
+                                        (= (load current) (- n 1)))
+                                   (store! current 0)
+                                   0))
+                             0)
+                         (if (or (view/key-pressed? (mut v) 262)
+                                 (= transport 3))
+                             (do
+                               (store! current
+                                       (timeline/clamp-revision (+ (load current)
+                                                                   1)
+                                                                n))
+                               (store! live-mode false)
+                               (store! playing false)
+                               (store! animation-paused false))
+                             0)
+                         (if (or (view/key-pressed? (mut v) 263)
+                                 (= transport 1))
+                             (do
+                               (store! current
+                                       (timeline/clamp-revision (- (load current)
+                                                                   1)
+                                                                n))
+                               (store! live-mode false)
+                               (store! playing false)
+                               (store! animation-paused false))
+                             0)
+                         (if (or (view/key-pressed? (mut v) 91) (= transport 4))
+                             (store! (field v speed)
+                                     (r/clamp (/ (load (field v speed)) 2.0)
+                                              0.125
+                                              16.0))
+                             0)
+                         (if (or (view/key-pressed? (mut v) 93) (= transport 5))
+                             (store! (field v speed)
+                                     (r/clamp (* (load (field v speed)) 2.0)
+                                              0.125
+                                              16.0))
+                             0)
+                         (if (or (load scrubbing)
+                                 (and clicked
+                                      (> my (+ bottom 12.0))
+                                      (< my (+ bottom 44.0))
+                                      (> mx 245.0)
+                                      (< mx
+                                         (- (cast f64 (r/GetScreenWidth)) 155.0))))
+                             (do
+                               (store! scrubbing true)
+                               (store! current
+                                       (timeline/clamp-revision (cast i64
+                                                                      (+ 0.5
+                                                                         (* (/ (- mx
+                                                                                  250.0)
+                                                                               (- (cast f64
+                                                                                        (r/GetScreenWidth))
+                                                                                  410.0))
+                                                                            (cast f64
+                                                                                  (- n
+                                                                                     1)))))
+                                                                n))
+                               (store! playing false)
+                               (store! animation-paused false)
+                               (store! live-mode false))
+                             0)
+                         (if (= (r/IsMouseButtonDown 0) (cast u8 0))
+                             (store! scrubbing false)
+                             0)
+                         (if (load playing)
+                             (do
+                               (store! elapsed (+ (load elapsed) dt))
+                               (if (> (load elapsed)
+                                      (timeline/playback-period (load (field v
+                                                                             speed))))
+                                   (do
+                                     (store! elapsed 0.0)
+                                     (if (>= (load current) (- n 1))
+                                         (store! playing false)
+                                         (store! current (+ (load current) 1))))
+                                   0))
+                             0)
+                         (store! live-elapsed (+ (load live-elapsed) dt))
+                         (if (and (!= (cast i64 (load working)) 0)
+                                  (live/ready? (load working))
+                                  (publication-ready? (load working)
+                                                      (mut upload-stage)))
+                             (let [job (load working)
+                                   next (field job snapshot)
+                                   previous
+                                     (if (= (cast i64 (load latest)) 0)
+                                         (al/al-elem [m/Snapshot]
+                                                     (mut snapshots)
+                                                     (- n 1))
+                                         (load latest))]
+                               (store! (field v read-errors)
+                                       (load (field job errors)))
+                               (if (> (load (field job errors)) 0)
+                                   (do
+                                     (println "Live scan rejected: {} read errors; retaining the last complete snapshot"
+                                              (load (field job errors)))
+                                     0)
+                                   0)
+                               (if (and (= (load (field job errors)) 0)
+                                        (load (field job changed)))
+                                   (let [published (r/GetTime)]
+                                     (if (load (field job geometry-ready))
+                                         (let [model
+                                                 (terrain/take-upload! (mut upload-stage))]
+                                           (terrain/unload-chunks! (field v
+                                                                          terrain-chunks))
+                                           (store! (field v terrain-chunks)
+                                                   model)
+                                           (live/release-geometry! job))
+                                         0)
+                                     (world/adopt-layout! (mut w)
+                                                          (field job layout))
+                                     (let [moved (load (field job moved))]
+                                       (if (> moved 0)
+                                           (let [(mut revision) 0]
+                                             (println "Updated nested reservations for live growth")
+                                             (loop (if (>= (load revision) n)
+                                                       (break 0)
+                                                       0)
+                                               (world/apply-layout! (mut w)
+                                                                    (al/al-elem [m/Snapshot]
+                                                                                (mut snapshots)
+                                                                                (load revision)))
+                                               (store! revision
+                                                       (+ (load revision) 1))))
+                                           0))
+                                     (store! latest next)
+                                     (println "Snapshot published: {} entities, {} read errors, {} ms worker geometry, {} ms worker graph, {} ms render-thread publication"
+                                              (al/al-len (load (field next
+                                                                      entities)))
+                                              (load (field job errors))
+                                              (load (field job geometry-ms))
+                                              (load (field job graph-ms))
+                                              (* 1000.0
+                                                 (- (r/GetTime) published)))
+                                     0)
+                                   0)
+                               (store! working (cast (ptr live/Job) 0)))
+                             0)
+                         (if (and (load live-mode)
+                                  (= (cast i64 (load working)) 0)
+                                  (> (load live-elapsed) 0.75))
+                             (let [job
+                                     (if (= (load latest)
+                                            (field job-a snapshot))
+                                         job-b
+                                         job-a)]
+                               (store! live-elapsed 0.0)
+                               (if (= (live/start-prepared! job
+                                                            (mut w)
+                                                            (if (= (cast i64
+                                                                         (load latest))
+                                                                   0)
+                                                                (al/al-elem [m/Snapshot]
+                                                                            (mut snapshots)
+                                                                            (- n
+                                                                               1))
+                                                                (load latest))
+                                                            (= (cast i64
+                                                                     (load latest))
+                                                               0))
+                                      0)
+                                   (store! working job)
+                                   (do
+                                     (println "Unable to start live analysis worker")
+                                     (store! live-mode false))))
+                             0)
+                         (store! (field v time)
+                                 (+ (load (field v time))
+                                    (animation/clock-step dt
+                                                          (load (field v speed))
+                                                          (load animation-paused))))
+                         (store! (field v age)
+                                 (+ (load (field v age))
+                                    (animation/clock-step dt
+                                                          (load (field v speed))
+                                                          (load animation-paused))))
+                         (if (!= previous-index (load current))
+                             (store! live-mode false)
+                             0)
+                         (let [snapshot
+                                 (if (and (load live-mode)
+                                          (!= (cast i64 (load latest)) 0))
+                                     (load latest)
+                                     (al/al-elem [m/Snapshot]
+                                                 (mut snapshots)
+                                                 (load current)))]
+                           ;; Copy the identity before worker arenas can be recycled;
+                           ;; no pointer into the old live snapshot is retained here.
+                           (if (!= snapshot previous-display)
+                               (do
+                                 (store! (field v selected)
+                                         (if had-selection
+                                             (world/find-entity (load (field snapshot
+                                                                             entities))
+                                                                selected-id)
+                                             -1))
+                                 (store! (field v hovered) -1)
+                                 (view/begin-change! (mut v) snapshot)
+                                 (view/refresh-folders! (mut v)
+                                                        (mut w)
+                                                        snapshot))
+                               0)
+                           (view/update-camera! (mut v) (mut w) snapshot dt)
+                           ;; Snapshot replacement and resizing can shrink the content
+                           ;; even while the pointer is outside the inspector.
+                           (store! (field v inspector-scroll)
+                                   (view/inspector-offset-for (mut v)
+                                                              snapshot
+                                                              bottom
+                                                              (load (field v
+                                                                           inspector-scroll))))
+                           (if (and (not search-blocked)
+                                    (> mx
+                                       (- (cast f64 (load (field v width)))
+                                          300.0))
+                                    (> my 76.0)
+                                    (< my bottom))
+                               (store! (field v inspector-scroll)
+                                       (r/clamp (- (load (field v
+                                                                inspector-scroll))
+                                                   (* 38.0
+                                                      (cast f64
+                                                            (r/GetMouseWheelMove))))
+                                                0.0
+                                                (if (< bottom
+                                                       (view/inspector-height-for (mut v)
+                                                                                  snapshot))
+                                                    (- (view/inspector-height-for (mut v)
+                                                                                  snapshot)
+                                                       bottom)
+                                                    0.0)))
+                               0)
+                           (if (and clicked
+                                    (< (load (field v selected)) 0)
+                                    (< (load (field v selected-island)) 0)
+                                    (< (load (field (field v folders) selected))
+                                       0)
+                                    (not (view/member-mode? (mut v) snapshot))
+                                    (> mx
+                                       (- (cast f64 (load (field v width)))
+                                          278.0))
+                                    (> my 76.0)
+                                    (< my bottom))
+                               (let [local-y
+                                       (+ my (load (field v inspector-scroll)))
+                                     row
+                                       (cast i64
+                                             (r/floor (/ (- local-y 704.0) 44.0)))
+                                     at (view/changed-index snapshot row)]
+                                 (if (and (>= row 0) (>= at 0))
+                                     (let [e
+                                             (al/al-get (load (field snapshot
+                                                                     entities))
+                                                        at)]
+                                       (store! (field v selected) at)
+                                       (store! (field v cursor-zoom) false)
+                                       (store! (field v target)
+                                               (load (field e position)))
+                                       (store! (field v desired-zoom) 12.0))
+                                     0))
+                               0)
+                           (if (and clicked
+                                    (>= (load (field v selected)) 0)
+                                    (> mx
+                                       (- (cast f64 (load (field v width)))
+                                          278.0))
+                                    (> my 76.0)
+                                    (< my bottom))
+                               (let [row
+                                       (cast i64
+                                             (r/floor (/ (- (+ my
+                                                               (load (field v
+                                                                            inspector-scroll)))
+                                                            590.0)
+                                                         80.0)))
+                                     entity
+                                       (al/al-get (load (field snapshot
+                                                               entities))
+                                                  (load (field v selected)))]
+                                 (if (and (>= row 0)
+                                          (< row
+                                             (m/member-count entity)))
+                                     (view/select-member! (mut v) entity row)
+                                     0))
+                               0)
+                           (if (and clicked
+                                    (< (load (field v selected)) 0)
+                                    (>= (load (field v selected-island)) 0)
+                                    (> mx
+                                       (- (cast f64 (load (field v width)))
+                                          278.0))
+                                    (> my 76.0)
+                                    (< my bottom))
+                               (let [row
+                                       (cast i64
+                                             (r/floor (/ (- (+ my
+                                                               (load (field v
+                                                                            inspector-scroll)))
+                                                            380.0)
+                                                         44.0)))
+                                     index
+                                       (view/island-entity-index snapshot
+                                                                 (load (field v
+                                                                              selected-island))
+                                                                 row)]
+                                 (if (>= index 0)
+                                     (let [e
+                                             (al/al-get (load (field snapshot
+                                                                     entities))
+                                                        index)]
+                                       (store! (field v selected) index)
+                                       (store! (field v inspector-scroll) 0.0)
+                                       (store! (field v target)
+                                               (load (field e position)))
+                                       (store! (field v cursor-zoom) false)
+                                       (store! (field v desired-zoom) 12.0))
+                                     0))
+                               0)
+                           (if (view/key-pressed? (mut v) 82)
+                               (view/fit-world! (mut v) (mut w))
+                               0)
+                           (if (and clicked
+                                    (> mx 18.0)
+                                    (< mx 182.0)
+                                    (> my (- bottom 328.0))
+                                    (< my (- bottom 184.0)))
+                               (let [map (world/map-frame (mut w))]
+                                 (store! (field v cursor-zoom) false)
+                                 (store! (field v target)
+                                         (tactical/unproject (r/v2 mx my)
+                                                             map
+                                                             (r/v2 100.0
+                                                                   (- bottom
+                                                                      256.0)))))
+                               0)
+                           (view/folder-input! (mut v)
+                                               (mut w)
+                                               snapshot
+                                               clicked
+                                               mx
+                                               my
+                                               bottom)
+                           (view/scene (mut v) (mut w) snapshot)
+                           (view/ui (mut v)
+                                    (mut w)
+                                    snapshot
+                                    (scratch/scratch-allocator (mut frame-arena))
+                                    revisions
+                                    (if (load live-mode) n (load current))
+                                    (load playing)))
+                         (scratch/scratch-reset! (mut frame-arena))
+                         (if (and (!= (cast i64 profile) 0)
+                                  (!= previous-index (load current)))
+                             (do
+                               (println "Seek {} -> {}: {} ms input-to-present (includes pacing)"
+                                        (+ previous-index 1)
+                                        (+ (load current) 1)
+                                        (* 1000.0 (- (r/GetTime) frame-start)))
+                               0)
+                             0)
+                         (store! frame (+ (load frame) 1))
+                         (if (and (!= (cast i64 profile) 0)
+                                  (or (= (% (load frame) 60) 0)
+                                      (<= (load frame) 3)))
+                             (do
+                               (println "CPU frame {}: shadow={} ms, world={} ms, post/UI/present/pacing={} ms"
+                                        (load frame)
+                                        (load (field v shadow-ms))
+                                        (load (field v world-ms))
+                                        (load (field v present-ms)))
+                               (println "World geometry CPU: terrain={} ms, glyphs={} ms"
+                                        (load (field v terrain-ms))
+                                        (load (field v glyph-ms)))
+                               (println "Scene CPU: water={} ms, streets={} ms, routes={} ms"
+                                        (load (field v water-ms))
+                                        (load (field v streets-ms))
+                                        (load (field v routes-ms)))
+                               0)
+                             0)
+                         (if (and (!= (cast i64 capture) 0)
+                                  (= (load frame) capture-frames))
+                             (let [image (r/LoadImageFromScreen)]
+                               (r/ExportImage image capture)
+                               (r/UnloadImage image)
+                               (println "Capture: revision={}, live={}, selected={}, zoom={}, fps={}, transition-age={}, animation-paused={}, speed={}, playing={}, source-open={}, member={}"
+                                        (load current)
+                                        (load live-mode)
+                                        (load (field v selected))
+                                        (load (field v zoom))
+                                        (r/GetFPS)
+                                        (load (field v age))
+                                        (load animation-paused)
+                                        (load (field v speed))
+                                        (load playing)
+                                        (load (field v source-open))
+                                        (load (field v selected-member)))
+                               (println "Focus: island={}, loading-history={}, target=({}, {})"
+                                        (load (field v selected-island))
+                                        (load (field v loading-history))
+                                        (load (field (field v target) x))
+                                        (load (field (field v target) z)))
+                               (println "Visible islands: {} / {} reserved history sites"
+                                        (view/present-island-count (mut v))
+                                        (al/al-len (load (field w islands))))
+                               (println "Folder focus: {}; borders={}; links={}"
+                                        (load (field (field v folders) selected))
+                                        (load (field v show-borders))
+                                        (load (field v show-links)))
+                               (break 0))
+                             0)))
+                     (if (and (!= (cast i64 (load working)) 0)
+                              (not (load (field (load working) joined))))
+                         (live/join! (load working))
+                         0)
+                     (terrain/unload-chunks! (field upload-stage chunks))
+                     (live/close! job-a)
+                     (live/close! job-b)
+                     (search/close! (field v search))
+                     (if (!= (cast i64 replay-path) 0)
+                         (do (r/UnloadAutomationEventList replay) 0)
+                         0)
+                     (scratch/scratch-close! (mut frame-arena))
+                     (r/UnloadModel (load (field v terrain)))
+                     (terrain/unload-chunks! (field v terrain-chunks))
+                     (view/unload-proxies! (mut v))
+                     (r/UnloadModel (load (field v proxy-model)))
+                     (r/UnloadModel (load (field v town-hall)))
+                     (r/UnloadModel (load (field v town-coarse)))
+                     (al/al-free! (mut (field v island-counts)))
+                     (view/close-folders! (mut v))
+                     (r/UnloadModel (load (field v water)))
+                     (let [(mut tree) 0]
+                       (loop (if (>= (load tree) 17) (break 0) 0)
+                         (r/UnloadModel (load (index (field v trees)
+                                                     (load tree))))
+                         (store! tree (+ (load tree) 1))))
+                     (r/UnloadRenderTexture (load (field v texture)))
+                     (r/UnloadRenderTexture (load (field v minimap)))
+                     (al/al-free! (mut (field v minimap-triangles)))
+                     (al/al-free! (mut (field v impact-distances)))
+                     (let [(mut slab) 0]
+                       (loop (if (>= (load slab) 45) (break 0) 0)
+                         (r/UnloadModel (load (index (field v slabs)
+                                                     (load slab))))
+                         (store! slab (+ (load slab) 1))))
+                     (r/UnloadRenderTexture (load (field v shadow)))
+                     (let [(mut courtyard) 0]
+                       (loop (if (>= (load courtyard) 5) (break 0) 0)
+                         (r/UnloadModel (load (index (field v courtyards)
+                                                     (load courtyard))))
+                         (store! courtyard (+ (load courtyard) 1))))
+                     (r/UnloadShader (load (field v light)))
+                     (let [(mut function) 0]
+                       (loop (if (>= (load function) 5) (break 0) 0)
+                         (r/UnloadModel (load (index (field v functions)
+                                                     (load function))))
+                         (store! function (+ (load function) 1))))
+                     (r/UnloadShader (load (field v depth)))
+                     (r/UnloadShader (load (field v post)))
+                     (r/UnloadShader (load (field v ocean)))
+                     (r/UnloadFont (load (field v font))))
+                   (r/CloseWindow)
+                   0)))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (git/git_libgit2_init)
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+    (let [a (scratch/scratch-allocator (mut arena))
+          configured
+            (if (> argc (cast i32 1))
+                (load (index argv 1))
+                (git/env c"ATLAS_REPO"))
+          requested
+            (if (> argc (cast i32 2))
+                (load (index argv 2))
+                (cast (ptr i8) 0))
+          path
+            (if (= (cast i64 configured) 0)
+                (do (demo/ensure-demo! a) (demo/path))
+                configured)
+          repo (git/open path)
+          history-env (git/env c"ATLAS_HISTORY_LIMIT")
+          history-limit
+            (if (= (cast i64 history-env) 0)
+                9223372036854775807
+                (git/parse-history-limit (str/cstr->str history-env)))
+          result
+            (if (= (cast i64 repo) 0)
+                1
+                (if (< history-limit 1)
+                    (do
+                      (println "ATLAS_HISTORY_LIMIT must be a positive decimal integer within i64 range.")
+                      1)
+                    (run a
+                         repo
+                         requested
+                         history-limit
+                         (= (cast i64 configured) 0))))]
+      (if (!= (cast i64 repo) 0)
+          (do (git/git_repository_free repo) 0)
+          0)
+      (scratch/scratch-close! (mut arena))
+      (git/git_libgit2_shutdown)
+      result)))

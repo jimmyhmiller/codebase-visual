@@ -1,0 +1,13 @@
+# One changed declaration fixture: inspect all field states and select removed row.
+c 11
+e 10 7 1390 713 0 0
+e 11 6 0 0 0 0
+e 12 5 0 0 0 0
+e 70 7 750 488 0 0
+e 71 8 0 6 0 0
+e 72 8 0 0 0 0
+e 100 7 1390 850 0 0
+e 101 6 0 0 0 0
+e 102 5 0 0 0 0
+e 140 2 76 0 0 0
+e 141 1 76 0 0 0

@@ -1,0 +1,159 @@
+(module atlas.ray)
+
+(cimport "raylib.h" :flags ["-I/opt/homebrew/include"])
+
+(cimport "rlgl.h"
+         :flags
+         ["-I/opt/homebrew/include"]
+         :use
+         [rlGetMatrixProjection
+          rlSetClipPlanes
+          rlGetMatrixModelview
+          rlLoadFramebuffer
+          rlLoadTexture
+          rlLoadTextureDepth
+          rlFramebufferAttach
+          rlFramebufferComplete
+          rlUnloadFramebuffer
+          rlUnloadTexture
+          rlBegin
+          rlEnd
+          rlVertex3f
+          rlNormal3f
+          rlColor4ub
+          rlDisableDepthMask
+          rlEnableDepthMask
+          rlDrawRenderBatchActive
+          rlPushMatrix
+          rlPopMatrix
+          rlTranslatef
+          rlScalef])
+
+(cimport "math.h" :use [sin cos sqrt pow atan2 asin exp floor ceil fabs])
+
+(defn v3 [(x f64) (y f64) (z f64)] (-> Vector3)
+  (Vector3
+    :x (cast f32 x)
+    :y (cast f32 y)
+    :z (cast f32 z)))
+
+(defn v2 [(x f64) (y f64)] (-> Vector2)
+  (Vector2 :x (cast f32 x) :y (cast f32 y)))
+
+(defn rgba [(r i64) (g i64) (b i64) (a i64)] (-> Color)
+  (Color
+    :r (cast u8 r)
+    :g (cast u8 g)
+    :b (cast u8 b)
+    :a (cast u8 a)))
+
+(defn rect [(x f64) (y f64) (w f64) (h f64)] (-> Rectangle)
+  (Rectangle
+    :x (cast f32 x)
+    :y (cast f32 y)
+    :width (cast f32 w)
+    :height (cast f32 h)))
+
+(defn clamp [(x f64) (lo f64) (hi f64)] (-> f64)
+  (cond (< x lo) lo (> x hi) hi :else x))
+
+(defn mix [(a f64) (b f64) (t f64)] (-> f64)
+  (+ a (* (- b a) t)))
+
+(defn shade [(c Color) (s f64)] (-> Color)
+  (rgba (cast i64 (clamp (* (cast f64 (load (field c r))) s) 0.0 255.0))
+        (cast i64 (clamp (* (cast f64 (load (field c g))) s) 0.0 255.0))
+        (cast i64 (clamp (* (cast f64 (load (field c b))) s) 0.0 255.0))
+        (cast i64 (load (field c a)))))
+
+(defn distance2 [(a Vector3) (b Vector3)] (-> f64)
+  (let [x (- (cast f64 (load (field a x))) (cast f64 (load (field b x))))
+        z (- (cast f64 (load (field a z))) (cast f64 (load (field b z))))]
+    (+ (* x x) (* z z))))
+
+;;; Ground-plane panning preserves the elevation of the focus anchor.
+(defn pan-target [(target Vector3) (yaw f64) (dx f64) (dz f64)] (-> Vector3)
+  (v3 (+ (cast f64 (load (field target x)))
+         (- (* dx (cos yaw)) (* dz (sin yaw))))
+      (cast f64 (load (field target y)))
+      (+ (cast f64 (load (field target z)))
+         (- (- 0.0 (* dx (sin yaw))) (* dz (cos yaw))))))
+
+;;; Normalize key chords in screen space, then invert ground foreshortening.
+;;; Nonzero input moves 55% of the visible vertical span per second.
+(defn keyboard-distance [(side f64)
+                         (forward f64)
+                         (zoom f64)
+                         (dt f64)
+                         (pitch f64)] (-> Vector2)
+  (let [length (sqrt (+ (* side side) (* forward forward)))]
+    (if (> length 0.0)
+        (let [travel (* zoom (* dt 0.55))]
+          (v2 (* (/ side length) travel)
+              (/ (* (/ forward length) travel) (sin pitch))))
+        (v2 0.0 0.0))))
+
+;;; Orthographic fovy is the visible vertical world span. Ground-plane motion
+;;; along forward projects by sin(pitch); invert it to keep the grabbed point.
+(defn drag-distance [(delta Vector2) (zoom f64) (height f64) (pitch f64)] (-> Vector2)
+  (v2 (* (- 0.0 (cast f64 (load (field delta x)))) (/ zoom height))
+      (/ (* (cast f64 (load (field delta y))) (/ zoom height)) (sin pitch))))
+
+(defn compass-direction [(yaw f64) (pitch f64) (heading f64)] (-> Vector2)
+  (let [x (sin (+ heading yaw))
+        y (* (- 0.0 (sin pitch)) (cos (+ heading yaw)))
+        length (sqrt (+ (* x x) (* y y)))]
+    (v2 (/ x length) (/ y length))))
+
+(defn orbit-camera [(target Vector3) (yaw f64) (pitch f64) (zoom f64)] (-> Camera3D)
+  (let [distance (if (> (* zoom 2.0) 100.0) (* zoom 2.0) 100.0)]
+    (Camera3D
+      :position
+        (v3 (+ (cast f64 (load (field target x)))
+               (* distance (* (cos pitch) (sin yaw))))
+            (+ (cast f64 (load (field target y))) (* distance (sin pitch)))
+            (+ (cast f64 (load (field target z)))
+               (* distance (* (cos pitch) (cos yaw)))))
+      :target target
+      :up (v3 0.0 1.0 0.0)
+      :fovy (cast f32 zoom)
+      :projection 1)))
+
+;;; Offset is measured from the world viewport center, in logical pixels.
+;;; Correct the target by the same incremental scale used for this frame.
+(defn zoom-target [(target Vector3)
+                   (yaw f64)
+                   (pitch f64)
+                   (before f64)
+                   (after f64)
+                   (offset Vector2)
+                   (height f64)] (-> Vector3)
+  (let [travel (drag-distance offset (- after before) height pitch)]
+    (pan-target target
+                yaw
+                (cast f64 (load (field travel x)))
+                (cast f64 (load (field travel y))))))
+
+(defn matrix-multiply [(a Matrix) (b Matrix)] (-> Matrix)
+  (let [(mut out) (zeroed Matrix)
+        (mut row) 0]
+    (loop (if (>= (load row) 4) (break 0) 0)
+      (let [(mut col) 0]
+        (loop (if (>= (load col) 4) (break 0) 0)
+          (let [(mut k) 0
+                (mut sum) 0.0]
+            (loop (if (>= (load k) 4) (break 0) 0)
+              (store! sum
+                      (+ (load sum)
+                         (* (cast f64
+                                  (load (index (field a m0)
+                                               (+ (* (load row) 4) (load k)))))
+                            (cast f64
+                                  (load (index (field b m0)
+                                               (+ (* (load k) 4) (load col))))))))
+              (store! k (+ (load k) 1)))
+            (store! (index (field out m0) (+ (* (load row) 4) (load col)))
+                    (cast f32 (load sum))))
+          (store! col (+ (load col) 1))))
+      (store! row (+ (load row) 1)))
+    (load out)))

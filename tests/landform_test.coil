@@ -1,0 +1,193 @@
+(module atlas.tests.landform)
+(import "atlas.landform" :as land)
+(import "atlas.terrain" :as terrain)
+(import "atlas.model" :as m)
+(import "atlas.ray" :as r)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+
+(deftest coastline-seams-are-continuous-and-seeds-vary-shape
+         (let [(mut seed) 0
+               (mut difference) 0.0]
+           (loop (if (>= (load seed) 24) (break 0) 0)
+             (let [s (* (cast f64 (load seed)) 0.79)
+                   (mut angle) 0]
+               (assert (< (r/fabs (- (land/coast s 0.0 1.13)
+                                     (land/coast s 6.283185307179586 1.13)))
+                          0.0000001))
+               (loop (if (>= (load angle) 128) (break 0) 0)
+                 (let [a (* (cast f64 (load angle)) 0.049087385212)
+                       value (land/coast s a 1.13)
+                       nearby (land/coast s (+ a 0.0001) 1.13)
+                       other (land/coast (+ s 0.79) a 1.13)
+                       delta (- value other)]
+                   (assert (< (r/fabs (- value nearby)) 0.001))
+                   (store! difference (+ (load difference) (* delta delta))))
+                 (store! angle (+ (load angle) 1))))
+             (store! seed (+ (load seed) 1)))
+           (assert (> (/ (load difference) 3072.0) 0.0004))))
+
+(deftest coast-is-bounded-and-radial-rings-do-not-cross
+         (let [(mut seed) 0]
+           (loop (if (>= (load seed) 20) (break 0) 0)
+             (let [(mut angle) 0]
+               (loop (if (>= (load angle) 256) (break 0) 0)
+                 (let [s (* (cast f64 (load seed)) 0.93)
+                       a (* (cast f64 (load angle)) 0.024543692606)
+                       (mut ring) 0
+                       (mut previous) 0.0]
+                   (loop (if (>= (load ring) 200) (break 0) 0)
+                     (let [scale (* (cast f64 (load ring)) 0.01)
+                           rough (land/coast s a scale)
+                           radius (* scale rough)]
+                       (assert (>= rough 0.805))
+                       (assert (<= rough 1.17))
+                       (assert (>= radius (load previous)))
+                       (store! previous radius))
+                     (store! ring (+ (load ring) 1))))
+                 (store! angle (+ (load angle) 1))))
+             (store! seed (+ (load seed) 1)))))
+
+(deftest headlands-retain-contrast-and-positive-radial-derivative
+         (let [(mut seed) 0]
+           (loop (if (>= (load seed) 24) (break 0) 0)
+             (let [s (* (cast f64 (load seed)) 0.79)
+                   (mut lo) 2.0
+                   (mut hi) 0.0
+                   (mut i) 0]
+               (loop (if (>= (load i) 256) (break 0) 0)
+                 (let [a (* (cast f64 (load i)) 0.024543692606)
+                       c (land/coast s a 1.13)
+                       (mut j) 0]
+                   (if (< c (load lo)) (store! lo c) 0)
+                   (if (> c (load hi)) (store! hi c) 0)
+                   (loop (if (>= (load j) 20) (break 0) 0)
+                     (let [scale (* (cast f64 (load j)) 0.1)
+                           next (+ scale 0.0001)
+                           derivative
+                             (/ (- (* next (land/coast s a next))
+                                   (* scale (land/coast s a scale)))
+                                0.0001)]
+                       ;; |dc/dscale| <= .0125/.083 * (.05*11+.033*17).
+                       ;; Therefore d(scale*c)/dscale > .47 on [0,2].
+                       (assert (> derivative 0.47)))
+                     (store! j (+ (load j) 1))))
+                 (store! i (+ (load i) 1)))
+               (assert (> (- (load hi) (load lo)) 0.25)))
+             (store! seed (+ (load seed) 1)))))
+
+(deftest strata-preserve-waterline-and-plateau-height
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 256) (break 0) 0)
+             (let [a (* (cast f64 (load i)) 0.024543692606)]
+               (assert (< (r/fabs (+ (land/stratum-height 1.7 a -0.38) 0.38))
+                          0.000001))
+               (assert (< (r/fabs (- (land/stratum-height 1.7 a 1.94) 1.94))
+                          0.000001))
+               (let [(mut layer) 0]
+                 (loop (if (>= (load layer) 7) (break 0) 0)
+                   (let [y (+ -0.38 (* (cast f64 (load layer)) 0.34))]
+                     (assert (> (land/stratum-height 1.7 a (+ y 0.28))
+                                (land/stratum-height 1.7 a y))))
+                   (store! layer (+ (load layer) 1)))))
+             (store! i (+ (load i) 1)))))
+
+(deftest shared-profile-matches-cliffs-and-terraces
+         (assert (> (land/stratum-width) (land/cliff-width)))
+         (assert (> (land/cliff-width) 0.0))
+         (let [(mut layer) 0]
+           (loop (if (>= (load layer) 7) (break 0) 0)
+             (let [l (cast f64 (load layer))
+                   outer (- (land/coast-scale) (* l (land/stratum-width)))
+                   middle (- outer (* 0.5 (land/cliff-width)))
+                   terrace (- outer (* 0.95 (land/stratum-width)))
+                   base (+ -0.38 (* l 0.34))]
+               (assert (< (r/fabs (- (land/radial-height middle) (+ base 0.14)))
+                          0.000001))
+               (assert (< (r/fabs (- (land/radial-height terrace) (+ base 0.28)))
+                          0.000001)))
+             (store! layer (+ (load layer) 1))))
+         (assert (< (r/fabs (- (land/radial-height (land/plateau-scale)) 1.94))
+                    0.000001)))
+
+(deftest foundation-clearance-and-outer-seam
+         (let [(mut sites) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+               island
+                 (m/Island
+                   :name "test"
+                   :seed 83
+                   :position (r/v3 12.0 0.0 -8.0)
+                   :radius 10.0
+                   :count 1
+                   :changed 0)]
+           (al/al-push! (mut sites) (r/v3 12.0 2.0 -8.0))
+           (let [(mut i) 0]
+             (loop (if (>= (load i) 128) (break 0) 0)
+               (let [a (* (cast f64 (load i)) 0.049087385212)
+                     p
+                       (r/v3 (+ 12.0 (* 1.50 (r/cos a)))
+                             0.0
+                             (+ -8.0 (* 1.50 (r/sin a))))
+                     edge
+                       (terrain/plateau-point island
+                                              a
+                                              (land/plateau-scale)
+                                              (load sites))
+                     cliff
+                       (terrain/stratum-point island
+                                              a
+                                              (land/plateau-scale)
+                                              1.94)]
+                 (assert (< (r/fabs (land/foundation-mask p (load sites)))
+                            0.000001))
+                 (assert (< (r/fabs (- (land/plateau-height 0.7 1.0 1.0 0.2 0.0)
+                                       1.94))
+                            0.000001))
+                 (assert (< (r/distance2 edge cliff) 0.000001))
+                 (assert (< (r/fabs (- (cast f64 (load (field edge y)))
+                                       (cast f64 (load (field cliff y)))))
+                            0.000001)))
+               (store! i (+ (load i) 1))))
+           (al/al-free! (mut sites))))
+
+(deftest layout-radius-contains-foundations-including-large-modules
+         (let [(mut distance) 0]
+           (loop (if (>= (load distance) 500) (break 0) 0)
+             (let [d (cast f64 (load distance))
+                   radius (land/required-radius d)]
+               (assert (>= (+ (* radius (* (land/plateau-scale) 0.805))
+                              0.000001)
+                           (+ d 1.05))))
+             (store! distance (+ (load distance) 1)))))
+
+(deftest plateau-grid-normals-follow-slope-and-point-up
+         (let [(mut points) (al/al-new [r/Vector3] (alloc/malloc-allocator))
+               (mut ring) 0]
+           (loop (if (> (load ring) 2) (break 0) 0)
+             (let [(mut i) 0]
+               (loop (if (>= (load i) 16) (break 0) 0)
+                 (let [angle (* (cast f64 (load i)) 0.392699081698724)
+                       x (* (cast f64 (load ring)) (r/cos angle))
+                       z (* (cast f64 (load ring)) (r/sin angle))]
+                   (al/al-push! (mut points) (r/v3 x (+ 1.94 (* 0.1 x)) z)))
+                 (store! i (+ (load i) 1))))
+             (store! ring (+ (load ring) 1)))
+           (store! ring 1)
+           (loop (if (> (load ring) 2) (break 0) 0)
+             (let [(mut i) 0]
+               (loop (if (>= (load i) 16) (break 0) 0)
+                 (let [n
+                         (terrain/grid-normal (load points)
+                                              (load ring)
+                                              (load i)
+                                              2
+                                              16)
+                       x (cast f64 (load (field n x)))
+                       y (cast f64 (load (field n y)))
+                       z (cast f64 (load (field n z)))]
+                   (assert (< (r/fabs (+ x 0.099503719)) 0.00001))
+                   (assert (< (r/fabs (- y 0.99503719)) 0.00001))
+                   (assert (< (r/fabs z) 0.00001)))
+                 (store! i (+ (load i) 1))))
+             (store! ring (+ (load ring) 1)))
+           (al/al-free! (mut points))))

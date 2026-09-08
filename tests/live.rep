@@ -1,0 +1,4 @@
+# Raylib automation events: press L to enter live mode.
+c 2
+e 10 2 76 0 0 0
+e 11 1 76 0 0 0

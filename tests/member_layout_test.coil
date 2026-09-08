@@ -1,0 +1,99 @@
+(module atlas.tests.member-layout)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+(import "atlas.view" :as view)
+(import "atlas.model" :as m)
+(import "atlas.analyzer" :as analyzer)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+
+(deftest field-cells-fit-the-existing-site-with-positive-disjoint-volumes
+         (let [(mut count) 1]
+           (loop (if (> (load count) 257) (break 0) 0)
+             (let [side (glyph/member-grid (load count))
+                   (mut i) 0]
+               (assert (>= (* side (* side side)) (load count)))
+               (assert (< (* (- side 1) (* (- side 1) (- side 1))) (load count)))
+               (loop (if (>= (load i) (load count)) (break 0) 0)
+                 (let [b
+                         (glyph/member-bounds (r/v3 0.0 2.0 0.0)
+                                              (load count)
+                                              (load i))
+                       lo (load (field b min))
+                       hi (load (field b max))
+                       (mut j) 0]
+                   (assert (> (load (field hi x)) (load (field lo x))))
+                   (assert (> (load (field hi y)) (load (field lo y))))
+                   (assert (> (load (field hi z)) (load (field lo z))))
+                   (assert (>= (cast f64 (load (field lo x))) -0.58))
+                   (assert (<= (cast f64 (load (field hi x))) 0.58))
+                   (assert (>= (cast f64 (load (field lo z))) -0.5))
+                   (assert (<= (cast f64 (load (field hi z))) 0.5))
+                   (assert (> (cast f64 (load (field lo y))) 2.12))
+                   (assert (< (cast f64 (load (field hi y))) 3.47))
+                   (loop (if (>= (load j) (load i)) (break 0) 0)
+                     (let [other
+                             (glyph/member-bounds (r/v3 0.0 2.0 0.0)
+                                                  (load count)
+                                                  (load j))]
+                       (assert (= (r/CheckCollisionBoxes b other) (cast u8 0))))
+                     (store! j (+ (load j) 1))))
+                 (store! i (+ (load i) 1))))
+             (store! count (+ (* (load count) 2) 1)))))
+
+(deftest field-picking-selects-nearest-cell-and-not-empty-gaps
+         (let [p (r/v3 12.0 2.0 -9.0)
+               (mut i) 0]
+           (loop (if (>= (load i) 4) (break 0) 0)
+             (let [bounds (glyph/member-bounds p 4 (load i))
+                   lo (load (field bounds min))
+                   hi (load (field bounds max))
+                   origin
+                     (r/v3 (* 0.5
+                              (+ (cast f64 (load (field lo x)))
+                                 (cast f64 (load (field hi x)))))
+                           10.0
+                           (* 0.5
+                              (+ (cast f64 (load (field lo z)))
+                                 (cast f64 (load (field hi z))))))
+                   hit
+                     (glyph/member-hit (r/Ray :position origin
+                                         :direction (r/v3 0.0 -1.0 0.0))
+                                       p
+                                       4)]
+               (assert-eq (load (field hit index)) (load i)))
+             (store! i (+ (load i) 1)))
+           (let [gap
+                   (glyph/member-hit (r/Ray :position (r/v3 12.0 10.0 -9.0)
+                                       :direction (r/v3 0.0 -1.0 0.0))
+                                     p
+                                     4)
+                 miss
+                   (glyph/member-hit (r/Ray :position (r/v3 20.0 10.0 -9.0)
+                                       :direction (r/v3 0.0 -1.0 0.0))
+                                     p
+                                     4)]
+             (assert-eq (load (field gap index)) -1)
+             (assert (!= (load (field (field gap collision) hit)) (cast u8 0)))
+             (assert (= (load (field (field miss collision) hit)) (cast u8 0))))))
+
+(deftest field-selection-belongs-to-one-entity-and-resets-on-revision
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 (mut s) (m/new-snapshot a)
+                 (mut v) (zeroed view/View)]
+             (analyzer/analyze-source! (mut s)
+                                       "fields.coil"
+                                       "(defstruct A [(id i64)]) (defstruct B [(name i64)])")
+             (let [first (al/al-get (load (field s entities)) 0)
+                   second (al/al-get (load (field s entities)) 1)]
+               (view/select-member! (mut v) first 0)
+               (assert-eq (view/active-member (mut v) first) 0)
+               (assert-eq (view/active-member (mut v) second) -1)
+               (view/begin-change! (mut v) (mut s))
+               (assert-eq (view/active-member (mut v) first) -1)
+               (view/select-member! (mut v) first 20)
+               (assert-eq (view/active-member (mut v) first) -1)))
+           (scratch/scratch-close! (mut arena))))

@@ -1,0 +1,6 @@
+# Observe saved changes, then fit the expanded world.
+c 4
+e 10 2 76 0 0 0
+e 11 1 76 0 0 0
+e 100 2 82 0 0 0
+e 101 1 82 0 0 0

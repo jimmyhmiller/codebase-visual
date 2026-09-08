@@ -1,0 +1,129 @@
+(module atlas.repros.layout-report)
+(import "atlas.repository" :as git)
+(import "atlas.world" :as world)
+(import "atlas.view" :as view)
+(import "atlas.model" :as m)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.landform" :as land)
+(import "atlas.overview" :as overview)
+(import "atlas.ray" :as r)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+
+;;; Read-only demo layout report and replay calibration. No window or GPU.
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (git/git_libgit2_init)
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+    (let [a (scratch/scratch-allocator (mut arena))
+          repo (git/open c"build/demo-v2")
+          revisions (git/history a repo 24)
+          (mut snapshots) (al/al-new [m/Snapshot] a)
+          (mut w) (world/new-world a)
+          (mut v) (zeroed view/View)
+          (mut i) 0]
+      (loop (if (>= (load i) (al/al-len revisions)) (break 0) 0)
+        (let [(mut s) (git/snapshot a repo (al/al-get revisions (load i)))]
+          (if (> (load i) 0)
+              (world/reconcile! (al/al-elem [m/Snapshot]
+                                            (mut snapshots)
+                                            (- (load i) 1))
+                                (mut s))
+              0)
+          (world/register! (mut w) (mut s))
+          (al/al-push! (mut snapshots) (load s)))
+        (store! i (+ (load i) 1)))
+      (world/pack! (mut w))
+      (store! (field v width) 1600)
+      (store! (field v height) 1000)
+      (store! (field v yaw) 0.65)
+      (store! (field v pitch) 0.72)
+      (view/fit-world! (mut v) (mut w))
+      (store! i 0)
+      (loop (if (>= (load i) (al/al-len (load (field w islands)))) (break 0) 0)
+        (let [island (al/al-get (load (field w islands)) (load i))
+              (mut old-radius) 7.2
+              (mut j) 0]
+          (loop (if (>= (load j) (al/al-len (load (field w registry))))
+                    (break 0)
+                    0)
+            (let [e (al/al-get (load (field w registry)) (load j))]
+              (if (= (load (field e island)) (load i))
+                  (let [required
+                          (land/required-radius (r/sqrt (r/distance2 (load (field e
+                                                                                  position))
+                                                                     (load (field island
+                                                                                  position)))))]
+                    (if (> required (load old-radius))
+                        (store! old-radius required)
+                        0))
+                  0))
+            (store! j (+ (load j) 1)))
+          (let [position (load (field island position))]
+            (println "Island position: x={}, z={}"
+                     (load (field position x))
+                     (load (field position z))))
+          (println "Island {}: radius={}, worst-inlet-for-same-sites={}"
+                   (load (field island name))
+                   (load (field island radius))
+                   (load old-radius)))
+        (store! i (+ (load i) 1)))
+      (let [s (al/al-elem [m/Snapshot] (mut snapshots) 3)
+            camera
+              (r/orbit-camera (load (field v target))
+                              0.65
+                              0.72
+                              (load (field v zoom)))]
+        (world/apply-layout! (mut w) s)
+        (let [(mut groups)
+                (overview/build s
+                                (al/al-len (load (field w islands)))
+                                (alloc/malloc-allocator))
+              (mut slot) 0]
+          (loop (if (>= (load slot) (al/al-len (load (field groups groups))))
+                    (break 0)
+                    0)
+            (let [g (al/al-get (load (field groups groups)) (load slot))
+                  island
+                    (al/al-get (load (field w islands)) (load (field g island)))]
+              (if (> (load (field g total)) 0)
+                  (do
+                    (println "Overview {} kind={}: present={}, modified={}, added={}, removed={}, footprint={}"
+                             (load (field island name))
+                             (load (field g kind))
+                             (load (field g present))
+                             (load (index (field g counts) 1))
+                             (load (index (field g counts) 2))
+                             (load (index (field g counts) 3))
+                             (overview/footprint island (load (field g kind))))
+                    0)
+                  0))
+            (store! slot (+ (load slot) 1)))
+          (println "Overview unmapped: {}" (load (field groups unmapped)))
+          (overview/close! (mut groups)))
+        (store! i 0)
+        (loop (if (>= (load i) (al/al-len (load (field s entities))))
+                  (break 0)
+                  0)
+          (let [e (al/al-get (load (field s entities)) (load i))]
+            (if (and (!= (load (field e state)) 0) (= (load (field e kind)) 0))
+                (let [p (load (field e position))
+                      bounds (glyph/struct-bounds p (glyph/struct-levels e))
+                      roof
+                        (r/v3 (cast f64 (load (field p x)))
+                              (cast f64 (load (field (field bounds max) y)))
+                              (cast f64 (load (field p z))))
+                      pixel (r/GetWorldToScreenEx roof camera 1100 824)]
+                  (println "Roof {}: screen=({}, {}) index={}"
+                           (load (field e name))
+                           (+ 200.0 (cast f64 (load (field pixel x))))
+                           (+ 76.0 (cast f64 (load (field pixel y))))
+                           (load i))
+                  0)
+                0))
+          (store! i (+ (load i) 1))))
+      (git/git_repository_free repo))
+    (scratch/scratch-close! (mut arena)))
+  (git/git_libgit2_shutdown)
+  0)

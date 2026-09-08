@@ -1,0 +1,7 @@
+# Grab empty water with the primary button. No selection should occur on drag.
+c 5
+e 10 7 500 300 0 0
+e 11 6 0 0 0 0
+e 12 7 540 330 0 0
+e 13 7 580 350 0 0
+e 14 5 0 0 0 0

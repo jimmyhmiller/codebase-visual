@@ -1,0 +1,99 @@
+(module atlas.repros.hdr-target)
+(import "atlas.view" :as view)
+(import "atlas.ray" :as r)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+
+(cimport "rlgl.h" :flags ["-I/opt/homebrew/include"] :use [rlReadTexturePixels])
+
+;;; Native GPU regression: a normalized 8-bit attachment would return 1,1,.5.
+;;; Read back as floats so this checks storage, not an 8-bit screenshot.
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (r/SetConfigFlags (cast u32 128))
+  (r/InitWindow 160 120 c"Atlas HDR target regression")
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+    (let [shader
+            (r/LoadShaderFromMemory (cast (ptr u8) 0)
+                                    c"#version 330\nout vec4 finalColor;\nvoid main(){finalColor=vec4(4.0,2.0,0.5,1.0);}")
+          post
+            (r/LoadShaderFromMemory (cast (ptr u8) 0)
+                                    (str/str->cstr (scratch/scratch-allocator (mut arena))
+                                                   (include-str "../../assets/shaders/post.fs")))
+          (mut i) 0
+          (mut failures) 0]
+      (loop (if (>= (load i) 3) (break 0) 0)
+        (let [size (cast i32 (+ 64 (* (load i) 27)))
+              target (view/scene-target size size)]
+          (r/BeginTextureMode target)
+          (r/ClearBackground (r/rgba 0 0 0 255))
+          (r/BeginShaderMode shader)
+          (r/DrawRectangle 0 0 size size (r/rgba 255 255 255 255))
+          (r/EndShaderMode)
+          (r/EndTextureMode)
+          (let [pixels
+                  (cast (ptr f32)
+                        (rlReadTexturePixels (load (field (field target texture)
+                                                          id))
+                                             size
+                                             size
+                                             10))]
+            (if (= (cast i64 pixels) 0)
+                (store! failures (+ (load failures) 1))
+                (do
+                  (println "HDR {}px: {}, {}, {}"
+                           size
+                           (load (index pixels 0))
+                           (load (index pixels 1))
+                           (load (index pixels 2)))
+                  (if (and (< (r/fabs (- (cast f64 (load (index pixels 0))) 4.0))
+                              0.001)
+                           (< (r/fabs (- (cast f64 (load (index pixels 1))) 2.0))
+                              0.001)
+                           (< (r/fabs (- (cast f64 (load (index pixels 2))) 0.5))
+                              0.001))
+                      0
+                      (store! failures (+ (load failures) 1)))
+                  (r/MemFree (cast (ptr u8) pixels))
+                  0)))
+          ;; Exercise the actual post shader too: hue-preserving compression of
+          ;; 4:2:0.5 should produce approximately 255:128:32, not clipped yellow.
+          (let [output (r/LoadRenderTexture size size)]
+            (r/BeginTextureMode output)
+            (r/ClearBackground (r/rgba 0 0 0 255))
+            (r/BeginShaderMode post)
+            (r/SetShaderValueTexture post
+                                     (r/GetShaderLocation post c"sceneDepth")
+                                     (load (field target depth)))
+            (r/DrawTextureRec (load (field target texture))
+                              (r/rect 0.0
+                                      0.0
+                                      (cast f64 size)
+                                      (- 0.0 (cast f64 size)))
+                              (r/v2 0.0 0.0)
+                              (r/rgba 255 255 255 255))
+            (r/EndShaderMode)
+            (r/EndTextureMode)
+            (let [image (r/LoadImageFromTexture (load (field output texture)))
+                  pixel (r/GetImageColor image (/ size 2) (/ size 2))
+                  red (cast i64 (load (field pixel r)))
+                  green (cast i64 (load (field pixel g)))
+                  blue (cast i64 (load (field pixel b)))]
+              (println "Tone mapped {}px: {}, {}, {}" size red green blue)
+              (if (and (>= red 254)
+                       (>= green 127)
+                       (<= green 129)
+                       (>= blue 31)
+                       (<= blue 33))
+                  0
+                  (store! failures (+ (load failures) 1)))
+              (r/UnloadImage image))
+            (r/UnloadRenderTexture output))
+          (r/UnloadRenderTexture target))
+        (store! i (+ (load i) 1)))
+      (r/UnloadShader shader)
+      (r/UnloadShader post)
+      (r/CloseWindow)
+      (scratch/scratch-close! (mut arena))
+      (load failures))))

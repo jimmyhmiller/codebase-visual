@@ -1,0 +1,73 @@
+(module atlas.tests.history-page)
+(import "atlas.repository" :as git)
+(import "atlas.demo" :as demo)
+(import "atlas.live" :as live)
+(import "atlas.model" :as m)
+(import "atlas.world" :as world)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :as al)
+(import "coil.str" :as str)
+
+(cimport "unistd.h" :use [mkdtemp])
+
+(deftest historical-worker-loads-requested-commit-and-its-real-parent
+         (git/git_libgit2_init)
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 directory
+                   (mkdtemp (str/str->cstr a "build/atlas-history-test-XXXXXX"))]
+             (assert (!= (cast i64 directory) 0))
+             (assert-eq (demo/ensure-at! a (str/cstr->str directory)) 0)
+             (let [repo (git/open directory)
+                   revisions
+                     (git/history-all-from a
+                                           repo
+                                           9223372036854775807
+                                           (cast (ptr i8) 0))
+                   (mut head)
+                     (git/snapshot a
+                                   repo
+                                   (al/al-get revisions
+                                              (- (al/al-len revisions) 1)))
+                   (mut w) (world/new-world a)
+                   job (live/new-job a repo)]
+               (assert-eq (al/al-len revisions) 6)
+               (world/register! (mut w) (mut head))
+               (world/pack! (mut w))
+               (world/apply-layout! (mut w) (mut head))
+               (assert-eq (live/start-revision! job
+                                                (mut w)
+                                                (al/al-get revisions 0)
+                                                0)
+                          0)
+               (assert-eq (live/join! job) 0)
+               (let [revision (al/al-get revisions 0)]
+                 (assert (str/str-eq (load (field (field job snapshot) revision))
+                                     (load (field revision oid)))))
+               (assert (load (field job historical)))
+               (assert (load (field job changed)))
+               (assert-eq (load (field job errors)) 0)
+               (assert (> (al/al-len (load (field (field job snapshot) entities)))
+                          0))
+               (assert-eq (al/al-len (load (field (load (field job previous))
+                                                  entities)))
+                          0)
+               (assert-eq (live/start-revision! job
+                                                (mut w)
+                                                (al/al-get revisions 3)
+                                                3)
+                          0)
+               (assert-eq (live/join! job) 0)
+               (let [revision (al/al-get revisions 3)
+                     parent (al/al-get revisions 2)]
+                 (assert (str/str-eq (load (field (field job snapshot) revision))
+                                     (load (field revision oid))))
+                 (assert (str/str-eq (load (field (load (field job previous))
+                                                  revision))
+                                     (load (field parent oid)))))
+               (live/close! job)
+               (git/git_repository_free repo)))
+           (scratch/scratch-close! (mut arena)))
+         (git/git_libgit2_shutdown))

@@ -1,0 +1,30 @@
+(module atlas.tests.queue)
+(import "atlas.glyphs" :as glyph)
+(import "atlas.ray" :as r)
+
+(deftest queue-parts-preserve-openings-and-foundation-clearance
+         (let [(mut i) 0]
+           (loop (if (>= (load i) 13) (break 0) 0)
+             (let [part (glyph/queue-part (load i))
+                   p (load (field part center))
+                   size (load (field part size))
+                   x
+                     (+ 0.46
+                        (+ (r/fabs (cast f64 (load (field p x))))
+                           (* 0.5 (cast f64 (load (field size x))))))
+                   z
+                     (+ (r/fabs (cast f64 (load (field p z))))
+                        (* 0.5 (cast f64 (load (field size z)))))
+                   top
+                     (+ (cast f64 (load (field p y)))
+                        (* 0.5 (cast f64 (load (field size y)))))]
+               (assert (< (+ (* x x) (* z z)) 1.1025))
+               (assert (< top 0.441))
+               (assert (> (cast f64 (load (field size x))) 0.0))
+               (assert (> (cast f64 (load (field size y))) 0.0))
+               (assert (> (cast f64 (load (field size z))) 0.0))
+               ;; Parts over the central lane are low enough to expose its interior.
+               (if (< (r/fabs (cast f64 (load (field p x)))) 0.10)
+                   (assert (< top 0.341))
+                   0))
+             (store! i (+ (load i) 1)))))

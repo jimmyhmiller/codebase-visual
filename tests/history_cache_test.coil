@@ -1,0 +1,62 @@
+(module atlas.tests.history-cache)
+(import "atlas.history" :as history)
+(import "atlas.repository" :as git)
+(import "atlas.demo" :as demo)
+(import "atlas.analyzer" :as analyzer)
+(import "atlas.model" :as m)
+(import "atlas.world" :as world)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.scratch" :as scratch)
+(import "coil.str" :as str)
+
+(cimport "unistd.h" :use [mkdtemp])
+
+(deftest history-cache-reuses-blobs-without-sharing-mutable-entity-state
+         (git/git_libgit2_init)
+         (let [(mut arena) (zeroed scratch/ScratchArena)]
+           (scratch/scratch-init (mut arena) (alloc/malloc-allocator))
+           (let [a (scratch/scratch-allocator (mut arena))
+                 directory
+                   (mkdtemp (str/str->cstr a "build/atlas-cache-test-XXXXXX"))]
+             (assert (!= (cast i64 directory) 0))
+             (assert-eq (demo/ensure-at! a (str/cstr->str directory)) 0)
+             (let [repo (git/open directory)
+                   revisions (git/history-all-from a repo 100 (cast (ptr i8) 0))
+                   (mut registry) (analyzer/defaults a)
+                   (mut cache) (history/new-cache a)
+                   revision (al/al-get revisions 0)
+                   (mut first)
+                     (history/snapshot! (mut cache)
+                                        (mut registry)
+                                        repo
+                                        revision)
+                   count (load (field cache analyses))
+                   (mut empty) (m/new-snapshot a)]
+               (assert (> count 0))
+               (world/reconcile-owned! (mut empty) (mut first) true)
+               (let [(mut again)
+                       (history/snapshot! (mut cache)
+                                          (mut registry)
+                                          repo
+                                          revision)]
+                 (assert-eq (load (field cache analyses)) count)
+                 (assert-eq (al/al-len (load (field first entities)))
+                            (al/al-len (load (field again entities))))
+                 (let [one (al/al-get (load (field first entities)) 0)
+                       two (al/al-get (load (field again entities)) 0)]
+                   (assert-eq (load (field one state)) 2)
+                   (assert (not (load (field two previous-known))))
+                   (assert (str/str-eq (load (field one source))
+                                       (load (field two source)))))
+                 (world/reconcile-owned! (mut first) (mut again) true)
+                 (let [two (al/al-get (load (field again entities)) 0)]
+                   (assert-eq (load (field two state)) 0)
+                   (assert (str/str-eq (load (field two previous-source))
+                                       (load (field two source))))))
+               (let [second (al/al-get revisions 1)]
+                 (assert (str/str-eq (history/parent-oid a repo second)
+                                     (load (field revision oid)))))
+               (git/git_repository_free repo)))
+           (scratch/scratch-close! (mut arena)))
+         (git/git_libgit2_shutdown))
